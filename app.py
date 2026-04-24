@@ -1,3 +1,12 @@
+"""
+Bitcoin 5-Minute Prediction Terminal
+=====================================
+- TradingView WebSocket (BITSTAMP:BTCUSD)
+- XGBoost model, 5-min candles, win/loss tracking
+- GMT+3 timezone, prices with 2 decimal places
+- No TP/SL, no extra text, clean UI
+"""
+
 import asyncio
 import json
 import logging
@@ -10,6 +19,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from queue import Empty, Queue
 from typing import Deque, Optional
+
 import numpy as np
 import pandas as pd
 import websocket as ws_client
@@ -523,7 +533,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>BTC 5-Min Predictor</title>
-<link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap" rel="stylesheet">
 <style>
   *{margin:0;padding:0;box-sizing:border-box;}
   :root{
@@ -532,22 +542,21 @@ HTML_CONTENT = r"""<!DOCTYPE html>
     --green:#00E5A0;--red:#FF4560;--orange:#F7931A;--blue:#38BDF8;
     --green-dim:#00E5A015;--red-dim:#FF456015;--orange-dim:#F7931A15;
   }
-  body{background:var(--bg);font-family:'Syne',sans-serif;color:var(--text);padding:20px;min-height:100vh;}
+  body{background:var(--bg);font-family:'Inter',sans-serif;color:var(--text);padding:20px;min-height:100vh;}
 
   /* FIX: was 'Serif';; — now correctly references the loaded Google Font */
-  .mono{font-family: 'Inter', sans-serif;}
+  .mono{font-family:'Inter',sans-serif;}
 
   /* ── Header ── */
   .header{
-    display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:14px;  
+    display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:14px;
     background:var(--surface);padding:14px 22px;border-radius:10px;
-    border:1px solid var(--border);margin-bottom:25px;
+    border:1px solid var(--border);margin-bottom:18px;
   }
   .header h1{font-size:1.25rem;font-weight:800;color:var(--orange);letter-spacing:1px;}
-  .stats{display:flex;gap:10px;flex-wrap:wrap;}
   .stat{
-    background:var(--card);padding:5px 14px;border-radius:10px;
-    font-size:0.75rem;font-weight:700;font-family: 'Inter', sans-serif;
+    background:var(--card);padding:15px 14px;border-radius:10px;
+    font-size:0.85rem;font-weight:700;font-family:'Inter',sans-serif;
     border:1px solid var(--border);
   }
   .stat.win{color:var(--green);}
@@ -557,14 +566,14 @@ HTML_CONTENT = r"""<!DOCTYPE html>
   /* ── Status bar ── */
   .status-bar{
     display:flex;align-items:center;gap:10px;
-    background:var(--surface);padding:7px 16px;border-radius:7px;
+    background:var(--surface);padding:10px 16px;border-radius:2px;
     border:1px solid var(--border);margin-bottom:18px;font-size:0.72rem;
   }
   .dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;}
   .dot-ok{background:var(--green);box-shadow:0 0 6px var(--green);animation:pulse 2s infinite;}
   .dot-bad{background:var(--red);}
   .dot-wait{background:var(--orange);animation:pulse 0.8s infinite;}
-  #clock-gmt3{margin-left:auto;font-family: 'Inter', sans-serif;color:white;font-size:0.85rem;}
+  #clock-gmt3{margin-left:auto;font-family:'Inter',sans-serif;color:white;font-size:0.85rem;}
   @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.35}}
 
   /* ── Main grid ── */
@@ -574,15 +583,15 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 
   /* ── Sidebar ── */
   .sidebar{display:flex;flex-direction:column;gap:14px;}
-  .card{background:var(--card);border-radius:3px;padding:16px;border:1px solid var(--border);}
+  .card{background:var(--card);border-radius:4px;padding:16px;border:1px solid var(--border);}
   .card-title{
-    font-size:1rem;text-transform:uppercase;letter-spacing:2px;
+    font-size:0.85rem;text-transform:uppercase;letter-spacing:2px;
     color:var(--muted);margin-bottom:10px;font-weight:600;
   }
 
   /* ── Price card ── */
-  .price{font-size:2rem;font-weight:700;font-family: 'Inter', sans-serif;margin-bottom:5px;}
-  .pchange{font-size:0.78rem;padding:3px 10px;border-radius:5px;display:inline-block;font-family: 'Inter', sans-serif;}
+  .price{font-size:2rem;font-weight:700;font-family:'Inter',sans-serif;margin-bottom:5px;}
+  .pchange{font-size:0.78rem;padding:3px 10px;border-radius:5px;display:inline-block;font-family:'Inter',sans-serif;}
 
   /* ── Prediction card ── */
   .pred-row{display:flex;align-items:baseline;justify-content:space-between;margin:10px 0 8px;}
@@ -594,7 +603,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
   /* ── Countdown ── */
   .countdown{display:flex;align-items:center;gap:14px;}
   .cd-ring{width:58px;height:58px;transform:rotate(-90deg);}
-  .cd-text{font-size:1.8rem;font-weight:700;color:var(--orange);font-family: 'Inter', sans-serif;}
+  .cd-text{font-size:1.8rem;font-weight:700;color:var(--orange);font-family:'Inter',sans-serif;}
 
   /* ── OHLC + Performance row ── */
   .bottom-row{display:grid;gap:14px;grid-template-columns:1fr 1fr;margin-bottom:14px;}
@@ -602,18 +611,18 @@ HTML_CONTENT = r"""<!DOCTYPE html>
   .ohlc-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:6px;}
   .ohlc-cell{background:var(--surface);border-radius:6px;padding:7px 10px;border:1px solid var(--border);}
   .ohlc-cell .lbl{font-size:0.6rem;color:var(--muted);letter-spacing:1.5px;text-transform:uppercase;}
-  .ohlc-cell .val{font-size:0.95rem;font-weight:700;margin-top:2px;font-family: 'Inter', sans-serif;}
+  .ohlc-cell .val{font-size:0.88rem;font-weight:700;margin-top:2px;font-family:'Inter',sans-serif;}
   .perf-row{display:flex;gap:10px;margin-top:8px;}
   .perf-stat{flex:1;text-align:center;background:var(--surface);border-radius:7px;padding:8px;border:1px solid var(--border);}
-  .perf-num{font-size:1.35rem;font-weight:700;font-family: 'Inter', sans-serif;}
+  .perf-num{font-size:1.35rem;font-weight:700;font-family:'Inter',sans-serif;}
   .perf-lbl{font-size:0.6rem;color:var(--muted);letter-spacing:1.5px;margin-top:2px;text-transform:uppercase;}
 
   /* ── History table ── */
   .table-wrapper{overflow-x:auto;margin-top:10px;}
-  table{width:100%;border-collapse:collapse;font-size:0.8rem;}
+  table{width:100%;border-collapse:collapse;font-size:0.78rem;}
   th,td{padding:8px 8px;text-align:left;border-bottom:1px solid var(--border);}
   th{color:var(--muted);font-weight:600;font-size:0.65rem;text-transform:uppercase;letter-spacing:1px;}
-  td{font-family: 'Inter', sans-serif;}
+  td{font-family:'Inter',sans-serif;}
   .up{color:var(--green);}
   .down{color:var(--red);}
   tr:last-child td{border-bottom:none;}
@@ -639,7 +648,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 <div class="container" style="max-width:1400px;margin:0 auto;">
   <!-- Header -->
   <div class="header">
-    <h1>₿ BTC Price Trend Predictor</h1>
+    <h1>₿ Bitcoin Price Trend Predictor</h1>
   </div>
 
   <!-- Status bar -->
@@ -733,10 +742,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
     </div>
   </div>
 
-  <div style="display:flex;justify-content:center;margin-bottom:14px;">
-  </div>
-
-  <div class="disclaimer">⚠️ Educational only. Past accuracy does not guarantee future results.</div>
+  <div class="disclaimer">⚠️ For educational purpose only. Past accuracy does not guarantee future results.</div>
 </div>
 
 <script src="https://s3.tradingview.com/tv.js"></script>
@@ -837,9 +843,6 @@ HTML_CONTENT = r"""<!DOCTYPE html>
     const losses = d.losses || 0;
     const total  = wins + losses;
     const acc    = total ? (wins / total * 100).toFixed(1) + '%' : '--%';
-    document.getElementById('header-wins').textContent   = wins;
-    document.getElementById('header-losses').textContent = losses;
-    document.getElementById('header-acc').textContent    = acc;
     document.getElementById('p-wins').textContent        = wins;
     document.getElementById('p-losses').textContent      = losses;
     document.getElementById('p-acc').textContent         = acc;
