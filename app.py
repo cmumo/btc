@@ -353,18 +353,11 @@ def _close_current_window() -> None:
 
 # ============================================================
 # TRADINGVIEW WEBSOCKET
-# ─────────────────────────────────────────────────────────────
-# FIX: The original handshake was double-encoding the heartbeat.
-#      TradingView's protocol uses ~m~{len}~m~{payload} framing.
-#      The heartbeat must be sent as a raw framed string, NOT as
-#      a JSON object wrapped inside another ~m~ envelope.
 # ============================================================
 def _tv_frame(payload: str) -> str:
-    """Wrap a raw string payload in TradingView's ~m~len~m~payload framing."""
     return f"~m~{len(payload)}~m~{payload}"
 
 def _tv_json_frame(payload: dict) -> str:
-    """Serialize a dict to JSON then wrap in TV framing."""
     raw = json.dumps(payload)
     return _tv_frame(raw)
 
@@ -376,15 +369,11 @@ def tradingview_ws_thread() -> None:
         def on_open(ws_app):
             nonlocal retry_delay
             retry_delay = 2
-
             session = "qs_" + "".join(random.choices(string.ascii_lowercase + string.digits, k=12))
-
-            # FIX: heartbeat is a plain framed string, not a JSON object
             ws_app.send(_tv_frame("~h~1"))
-
-            ws_app.send(_tv_json_frame({"m": "set_locale",           "p": ["en", "US"]}))
+            ws_app.send(_tv_json_frame({"m": "set_locale", "p": ["en", "US"]}))
             ws_app.send(_tv_json_frame({"m": "quote_create_session", "p": [session]}))
-            ws_app.send(_tv_json_frame({"m": "quote_add_symbols",    "p": [session, SYMBOL]}))
+            ws_app.send(_tv_json_frame({"m": "quote_add_symbols", "p": [session, SYMBOL]}))
             logger.info(f"TradingView WS connected, session={session}")
 
         def on_message(ws_app, raw):
@@ -522,10 +511,6 @@ def _build_state_payload() -> dict:
 
 # ============================================================
 # HTML FRONTEND
-# ─────────────────────────────────────────────────────────────
-# FIX 1: .mono class and all inline font-family declarations
-#         changed from 'Serif';; → 'Space Mono', monospace
-# FIX 2: Font updated to Gill Sans throughout
 # ============================================================
 HTML_CONTENT = r"""<!DOCTYPE html>
 <html lang="en">
@@ -543,11 +528,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
     --green-dim:#00E5A015;--red-dim:#FF456015;--orange-dim:#F7931A15;
   }
   body{background:var(--bg);font-family:'Inter',sans-serif;color:var(--text);padding:20px;min-height:100vh;}
-
-  /* FIX: was 'Serif';; — now correctly references the loaded Google Font */
   .mono{font-family:'Inter',sans-serif;}
-
-  /* ── Header ── */
   .header{
     display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:14px;
     background:var(--surface);padding:14px 22px;border-radius:10px;
@@ -562,8 +543,6 @@ HTML_CONTENT = r"""<!DOCTYPE html>
   .stat.win{color:var(--green);}
   .stat.loss{color:var(--red);}
   .stat.acc{color:var(--orange);}
-
-  /* ── Status bar ── */
   .status-bar{
     display:flex;align-items:center;gap:10px;
     background:var(--surface);padding:10px 16px;border-radius:2px;
@@ -575,37 +554,25 @@ HTML_CONTENT = r"""<!DOCTYPE html>
   .dot-wait{background:var(--orange);animation:pulse 0.8s infinite;}
   #clock-gmt3{margin-left:auto;font-family:'Inter',sans-serif;color:white;font-size:0.85rem;}
   @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.35}}
-
-  /* ── Main grid ── */
   .main-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-bottom:18px;}
   @media(max-width:820px){.main-grid{grid-template-columns:1fr;}}
   #tv-chart{height:400px;border-radius:10px;overflow:hidden;background:var(--card);border:1px solid var(--border);}
-
-  /* ── Sidebar ── */
   .sidebar{display:flex;flex-direction:column;gap:14px;}
   .card{background:var(--card);border-radius:4px;padding:16px;border:1px solid var(--border);}
   .card-title{
     font-size:0.85rem;text-transform:uppercase;letter-spacing:2px;
     color:var(--muted);margin-bottom:10px;font-weight:600;
   }
-
-  /* ── Price card ── */
   .price{font-size:2rem;font-weight:700;font-family:'Inter',sans-serif;margin-bottom:5px;}
   .pchange{font-size:0.78rem;padding:3px 10px;border-radius:5px;display:inline-block;font-family:'Inter',sans-serif;}
-
-  /* ── Prediction card ── */
   .pred-row{display:flex;align-items:baseline;justify-content:space-between;margin:10px 0 8px;}
   .pred-arrow{font-size:2rem;line-height:1;}
   .pred-dir{font-size:1.7rem;font-weight:800;letter-spacing:2px;}
   .conf-bar{height:3px;background:var(--border);border-radius:2px;overflow:hidden;margin-top:4px;}
   .conf-fill{height:100%;width:0%;transition:width 0.4s ease;}
-
-  /* ── Countdown ── */
   .countdown{display:flex;align-items:center;gap:14px;}
   .cd-ring{width:58px;height:58px;transform:rotate(-90deg);}
   .cd-text{font-size:1.8rem;font-weight:700;color:var(--orange);font-family:'Inter',sans-serif;}
-
-  /* ── OHLC + Performance row ── */
   .bottom-row{display:grid;gap:14px;grid-template-columns:1fr 1fr;margin-bottom:14px;}
   @media(max-width:600px){.bottom-row{grid-template-columns:1fr;}}
   .ohlc-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:6px;}
@@ -616,8 +583,6 @@ HTML_CONTENT = r"""<!DOCTYPE html>
   .perf-stat{flex:1;text-align:center;background:var(--surface);border-radius:7px;padding:8px;border:1px solid var(--border);}
   .perf-num{font-size:1.35rem;font-weight:700;font-family:'Inter',sans-serif;}
   .perf-lbl{font-size:0.6rem;color:var(--muted);letter-spacing:1.5px;margin-top:2px;text-transform:uppercase;}
-
-  /* ── History table ── */
   .table-wrapper{overflow-x:auto;margin-top:10px;}
   table{width:100%;border-collapse:collapse;font-size:0.78rem;}
   th,td{padding:8px 8px;text-align:left;border-bottom:1px solid var(--border);}
@@ -627,48 +592,35 @@ HTML_CONTENT = r"""<!DOCTYPE html>
   .down{color:var(--red);}
   tr:last-child td{border-bottom:none;}
   tr:hover td{background:#ffffff04;}
-
-
-
   .disclaimer{
     background:var(--surface);border-radius:2px;padding:10px;
     font-size:1rem;text-align:center;color:#FACC15;
     border:1px solid #FACC1520;
   }
-
-  /* ── Flash animations ── */
   .flash-up{animation:flashUp 0.4s ease;}
   .flash-dn{animation:flashDn 0.4s ease;}
   @keyframes flashUp{0%,100%{color:var(--text)}50%{color:var(--green)}}
   @keyframes flashDn{0%,100%{color:var(--text)}50%{color:var(--red)}}
-
 </style>
 </head>
 <body>
 <div class="container" style="max-width:1400px;margin:0 auto;">
-  <!-- Header -->
   <div class="header">
     <h1>₿ Bitcoin Price Trend Predictor</h1>
   </div>
-
-  <!-- Status bar -->
   <div class="status-bar">
     <div class="dot dot-wait" id="ws-dot"></div>
     <span id="ws-txt">Connecting…</span>
     <span id="clock-gmt3">--:--:-- GMT+3</span>
   </div>
-
-  <!-- Main grid: chart + sidebar -->
   <div class="main-grid">
     <div id="tv-chart"><div id="tv-widget" style="width:100%;height:100%"></div></div>
     <div class="sidebar">
-      <!-- Price -->
       <div class="card">
         <div class="card-title">Live BTC / USD</div>
         <div class="price mono" id="price-val">$---.--</div>
         <span class="pchange mono" id="price-change">--%</span>
       </div>
-      <!-- Prediction -->
       <div class="card">
         <div class="card-title">Next 5-Min Prediction</div>
         <div class="pred-row">
@@ -679,7 +631,6 @@ HTML_CONTENT = r"""<!DOCTYPE html>
         <div class="conf-bar"><div class="conf-fill" id="conf-bar"></div></div>
         <div id="pred-window" style="margin-top:6px;font-size:0.68rem;color:var(--muted);"></div>
       </div>
-      <!-- Countdown -->
       <div class="card">
         <div class="card-title">Next window opens in</div>
         <div class="countdown">
@@ -693,8 +644,6 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       </div>
     </div>
   </div>
-
-  <!-- OHLC + Performance -->
   <div class="bottom-row">
     <div class="card">
       <div class="card-title">Current Window</div>
@@ -723,85 +672,92 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       </div>
     </div>
   </div>
-
-  <!-- History table -->
   <div class="card" style="margin-bottom:14px;">
     <div class="card-title">Prediction History (last 5)</div>
     <div class="table-wrapper">
       <table>
         <thead>
-          <tr>
-            <th>Window</th><th>Prediction</th><th>Conf</th>
-            <th>Act. Open</th><th>Act. Close</th><th>Actual</th><th>Result</th>
-          </tr>
+          <tr><th>Window</th><th>Prediction</th><th>Conf</th><th>Act. Open</th><th>Act. Close</th><th>Actual</th><th>Result</th></tr>
         </thead>
-        <tbody id="history-body">
-          <tr><td colspan="7" style="text-align:center;color:var(--muted);padding:18px;">Waiting for data…</td></tr>
-        </tbody>
+        <tbody id="history-body"><tr><td colspan="7" style="text-align:center;color:var(--muted);padding:18px;">Waiting for data…</td></tr></tbody>
       </table>
     </div>
   </div>
-
   <div class="disclaimer">⚠️ For educational purpose only. Past accuracy does not guarantee future results.</div>
 </div>
-
 <script src="https://s3.tradingview.com/tv.js"></script>
 <script>
-  // ── TradingView widget ──────────────────────────────────────
   new TradingView.widget({
     container_id: 'tv-widget', symbol: 'BITSTAMP:BTCUSD', interval: '5',
     theme: 'dark', style: '1', locale: 'en', toolbar_bg: '#080C14',
     enable_publishing: false, autosize: true, hide_side_toolbar: false
   });
 
-  // ── State ───────────────────────────────────────────────────
-  let ws, firstPrice = null, prevPrice = null;
+  let ws, firstPrice = null, prevPrice = null, reconnectAttempts = 0;
   const CIRC = 2 * Math.PI * 32;
+  const MAX_RECONNECT_ATTEMPTS = 10;
 
-  // ── GMT+3 clock ─────────────────────────────────────────────
   function updateClock() {
     const gmt3dt = new Date(Date.now() + 3 * 60 * 60 * 1000);
-    const hh = String(gmt3dt.getUTCHours()).padStart(2, '0');
-    const mm = String(gmt3dt.getUTCMinutes()).padStart(2, '0');
-    const ss = String(gmt3dt.getUTCSeconds()).padStart(2, '0');
-    document.getElementById('clock-gmt3').textContent = `${hh}:${mm}:${ss} GMT+3`;
+    document.getElementById('clock-gmt3').textContent = 
+      String(gmt3dt.getUTCHours()).padStart(2,'0') + ':' +
+      String(gmt3dt.getUTCMinutes()).padStart(2,'0') + ':' +
+      String(gmt3dt.getUTCSeconds()).padStart(2,'0') + ' GMT+3';
   }
   updateClock();
   setInterval(updateClock, 1000);
 
-  // ── Format price ─────────────────────────────────────────────
   function fmt(n) {
     if (n == null || n === '--' || n === 0) return '--';
     return '$' + Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   }
 
-  // ── WebSocket ───────────────────────────────────────────────
   function connect() {
-    // FIX: Use wss:// for secure WebSocket on Render HTTPS
     const protocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
-    ws = new WebSocket(`${protocol}${location.host}/ws`);
+    const wsUrl = `${protocol}${window.location.host}/ws`;
+    console.log('Connecting to:', wsUrl);
     
-    ws.onopen  = () => {
+    ws = new WebSocket(wsUrl);
+    
+    ws.onopen = () => {
+      console.log('WebSocket connected');
       document.getElementById('ws-dot').className = 'dot dot-ok';
       document.getElementById('ws-txt').textContent = 'Live';
+      reconnectAttempts = 0;
     };
-    ws.onclose = () => {
+    
+    ws.onclose = (event) => {
+      console.log('WebSocket closed:', event.code, event.reason);
       document.getElementById('ws-dot').className = 'dot dot-bad';
       document.getElementById('ws-txt').textContent = 'Disconnected';
-      setTimeout(connect, 3000);
+      
+      if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+        const delay = Math.min(3000 * Math.pow(1.5, reconnectAttempts), 30000);
+        reconnectAttempts++;
+        console.log(`Reconnecting in ${delay/1000}s (attempt ${reconnectAttempts})`);
+        setTimeout(connect, delay);
+      }
     };
-    ws.onerror = () => {
+    
+    ws.onerror = (error) => {
+      console.error('WebSocket error:', error);
       document.getElementById('ws-dot').className = 'dot dot-bad';
       document.getElementById('ws-txt').textContent = 'Error';
     };
-    ws.onmessage = e => render(JSON.parse(e.data));
+    
+    ws.onmessage = e => {
+      try {
+        render(JSON.parse(e.data));
+      } catch(err) {
+        console.error('Parse error:', err);
+      }
+    };
   }
 
-  // ── Render ──────────────────────────────────────────────────
   function render(d) {
     if (d.price != null) {
       if (firstPrice == null) firstPrice = d.price;
-      const chg    = (d.price - firstPrice) / firstPrice * 100;
+      const chg = (d.price - firstPrice) / firstPrice * 100;
       const priceEl = document.getElementById('price-val');
       if (prevPrice != null) {
         priceEl.classList.remove('flash-up', 'flash-dn');
@@ -812,7 +768,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       const pch = document.getElementById('price-change');
       pch.textContent = (chg >= 0 ? '+' : '') + chg.toFixed(2) + '%';
       pch.style.background = chg >= 0 ? 'var(--green-dim)' : 'var(--red-dim)';
-      pch.style.color       = chg >= 0 ? 'var(--green)'    : 'var(--red)';
+      pch.style.color = chg >= 0 ? 'var(--green)' : 'var(--red)';
       prevPrice = d.price;
     }
 
@@ -822,42 +778,40 @@ HTML_CONTENT = r"""<!DOCTYPE html>
     const pct = Math.min(1, (d.window_pct || 0) / 100);
     document.getElementById('cd-ring').style.strokeDashoffset = CIRC * (1 - pct);
 
-    const sig  = d.signal || 'HOLD';
+    const sig = d.signal || 'HOLD';
     const isUp = sig === 'UP', isDn = sig === 'DOWN';
-    const col  = isUp ? 'var(--green)' : isDn ? 'var(--red)' : 'var(--muted)';
+    const col = isUp ? 'var(--green)' : isDn ? 'var(--red)' : 'var(--muted)';
     document.getElementById('pred-arrow').textContent = isUp ? '▲' : isDn ? '▼' : '◆';
-    document.getElementById('pred-arrow').style.color  = col;
-    document.getElementById('pred-dir').textContent   = isUp ? 'UP' : isDn ? 'DOWN' : 'HOLD';
-    document.getElementById('pred-dir').style.color   = col;
-    document.getElementById('conf-pct').textContent   = (isUp || isDn) ? d.confidence + '%' : '--%';
-    document.getElementById('conf-pct').style.color   = col;
-    document.getElementById('conf-bar').style.width      = (d.confidence || 0) + '%';
+    document.getElementById('pred-arrow').style.color = col;
+    document.getElementById('pred-dir').textContent = isUp ? 'UP' : isDn ? 'DOWN' : 'HOLD';
+    document.getElementById('pred-dir').style.color = col;
+    document.getElementById('conf-pct').textContent = (isUp || isDn) ? d.confidence + '%' : '--%';
+    document.getElementById('conf-pct').style.color = col;
+    document.getElementById('conf-bar').style.width = (d.confidence || 0) + '%';
     document.getElementById('conf-bar').style.background = col;
     document.getElementById('pred-window').textContent = d.next_window ? `Next: ${d.next_window}` : '';
 
     if (d.ohlc) {
-      document.getElementById('o-open').textContent  = fmt(d.ohlc.open);
-      document.getElementById('o-high').textContent  = fmt(d.ohlc.high);
-      document.getElementById('o-low').textContent   = fmt(d.ohlc.low);
+      document.getElementById('o-open').textContent = fmt(d.ohlc.open);
+      document.getElementById('o-high').textContent = fmt(d.ohlc.high);
+      document.getElementById('o-low').textContent = fmt(d.ohlc.low);
       document.getElementById('o-close').textContent = fmt(d.ohlc.close);
     }
 
-    const wins   = d.wins   || 0;
-    const losses = d.losses || 0;
-    const total  = wins + losses;
-    const acc    = total ? (wins / total * 100).toFixed(1) + '%' : '--%';
-    document.getElementById('p-wins').textContent        = wins;
-    document.getElementById('p-losses').textContent      = losses;
-    document.getElementById('p-acc').textContent         = acc;
+    const wins = d.wins || 0, losses = d.losses || 0, total = wins + losses;
+    const acc = total ? (wins / total * 100).toFixed(1) + '%' : '--%';
+    document.getElementById('p-wins').textContent = wins;
+    document.getElementById('p-losses').textContent = losses;
+    document.getElementById('p-acc').textContent = acc;
 
     const tbody = document.getElementById('history-body');
     if (d.table && d.table.length) {
       tbody.innerHTML = d.table.map(r => {
         const predCls = r.predicted === 'UP' ? 'up' : r.predicted === 'DOWN' ? 'down' : '';
-        const actCls  = r.actual    === 'UP' ? 'up' : r.actual    === 'DOWN' ? 'down' : '';
+        const actCls = r.actual === 'UP' ? 'up' : r.actual === 'DOWN' ? 'down' : '';
         const predTxt = r.predicted === 'UP' ? '▲ UP' : r.predicted === 'DOWN' ? '▼ DOWN' : r.predicted;
-        const actTxt  = r.actual === '⏳'    ? '--'   : r.actual  === 'UP'    ? '▲ UP'   : r.actual === 'DOWN' ? '▼ DOWN' : r.actual;
-        const resTxt  = r.result === '⏳'    ? '--'   : r.result;
+        const actTxt = r.actual === '⏳' ? '--' : r.actual === 'UP' ? '▲ UP' : r.actual === 'DOWN' ? '▼ DOWN' : r.actual;
+        const resTxt = r.result === '⏳' ? '--' : r.result;
         return `<tr>
           <td style="color:var(--muted)">${r.window}</td>
           <td class="${predCls}">${predTxt}</td>
@@ -868,12 +822,8 @@ HTML_CONTENT = r"""<!DOCTYPE html>
           <td style="font-size:1rem;">${resTxt}</td>
         </tr>`;
       }).join('');
-    } else {
-      tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--muted);padding:18px;">Waiting for data…</td></tr>';
     }
   }
-
-
 
   connect();
 </script>
@@ -938,7 +888,6 @@ async def ws_endpoint(websocket: WebSocket):
             if websocket in ws_clients:
                 ws_clients.remove(websocket)
         logger.info(f"Client disconnected. Total={len(ws_clients)}")
-
 
 
 if __name__ == "__main__":
