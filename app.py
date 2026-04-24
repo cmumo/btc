@@ -1,7 +1,8 @@
 """
 Bitcoin 5-Minute Prediction Terminal
 =====================================
-- TradingView chart (BITSTAMP:BTCUSD) + Binance WebSocket for live prices
+- TradingView WebSocket (unofficial) for live BTC price ticks
+- TradingView chart widget (BINANCE:BTCUSDT) — same source as backend
 - XGBoost model, 5-min candles, win/loss tracking
 - GMT+3 timezone, prices with 2 decimal places
 - Correct port binding for Render ($PORT)
@@ -13,6 +14,8 @@ import json
 import logging
 import os
 import random
+import re
+import string
 import threading
 import time
 from collections import deque
@@ -40,22 +43,34 @@ logger = logging.getLogger(__name__)
 # ============================================================
 # CONSTANTS
 # ============================================================
-WINDOW_SECONDS     = 300          # 5-minute candles
-HISTORY_LIMIT      = 100
-MIN_CANDLES_TRAIN  = 12
-RETRAIN_EVERY      = 5
-TZ                 = timezone(timedelta(hours=3))  # GMT+3
+WINDOW_SECONDS    = 300          # 5-minute candles
+HISTORY_LIMIT     = 100
+MIN_CANDLES_TRAIN = 12
+RETRAIN_EVERY     = 5
+TZ                = timezone(timedelta(hours=3))   # GMT+3
+
+# TradingView symbol — must match the chart widget below
+TV_SYMBOL  = "BINANCE:BTCUSDT"
+TV_WS_URL  = "wss://data.tradingview.com/socket.io/websocket?from=chart%2F&date="
+TV_HEADERS = {
+    "Origin":     "https://www.tradingview.com",
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+}
 
 # ============================================================
-# SHARED STATE  (all access under state_lock)
+# SHARED STATE  (all mutation under state_lock)
 # ============================================================
-state_lock        = threading.Lock()
-completed_candles: Deque[dict] = deque(maxlen=HISTORY_LIMIT)
-history_rows:     List[dict]   = []
-live_candle:      Optional[dict] = None
-live_window_start: Optional[float] = None
-wins:             int = 0
-losses:           int = 0
+state_lock            = threading.Lock()
+completed_candles:    Deque[dict]   = deque(maxlen=HISTORY_LIMIT)
+history_rows:         List[dict]    = []
+live_candle:          Optional[dict] = None
+live_window_start:    Optional[float] = None
+wins:                 int = 0
+losses:               int = 0
 candles_since_retrain: int = 0
 
 model      = None
@@ -63,35 +78,152 @@ model_lock = threading.Lock()
 
 price_queue: Queue = Queue()
 
-# WebSocket clients — protected by a threading.Lock so threads and
-# the event loop can both interact with it safely via run_coroutine_threadsafe
-_clients:      List[WebSocket] = []
-_clients_lock: Optional[asyncio.Lock] = None   # created inside lifespan
-_main_loop:    Optional[asyncio.AbstractEventLoop] = None
+_clients:      List[WebSocket]                      = []
+_clients_lock: Optional[asyncio.Lock]               = None   # created in lifespan
+_main_loop:    Optional[asyncio.AbstractEventLoop]  = None
+
+# ============================================================
+# TRADINGVIEW WEBSOCKET HELPERS
+# ============================================================
+def _rand_str(n: int = 12) -> str:
+    return "".join(random.choices(string.ascii_lowercase + string.digits, k=n))
+
+
+def _pack(text: str) -> str:
+    """Wrap a string in TradingView wire format:  ~m~<len>~m~<text>"""
+    return f"~m~{len(text)}~m~{text}"
+
+
+def _tv_msg(func: str, args: list) -> str:
+    """Serialise and pack a TradingView JSON message."""
+    body = json.dumps({"m": func, "p": args}, separators=(",", ":"))
+    return _pack(body)
+
+
+def _parse_packets(raw: str) -> List[str]:
+    """
+    Extract all payloads from a raw TV frame.
+    Wire format: ~m~<len>~m~<payload>  (may repeat multiple times per recv)
+    """
+    packets, i = [], 0
+    while i < len(raw):
+        if raw[i: i + 3] != "~m~":
+            i += 1
+            continue
+        try:
+            end_len = raw.index("~m~", i + 3)
+            length  = int(raw[i + 3: end_len])
+            start   = end_len + 3
+            packets.append(raw[start: start + length])
+            i = start + length
+        except (ValueError, IndexError):
+            break
+    return packets
+
+
+# ============================================================
+# TRADINGVIEW WEBSOCKET THREAD  (replaces Binance WS)
+# ============================================================
+def tradingview_ws_thread() -> None:
+    """
+    Connects to TradingView's real-time quote feed, subscribes to
+    TV_SYMBOL, and pushes every last-price tick into price_queue.
+
+    TradingView wire protocol:
+      - Messages are packed as  ~m~<len>~m~<json>
+      - Server sends heartbeats like  ~h~N  — we must echo them back
+      - Quote updates arrive as  {"m":"qsd","p":[session, symbol, {"v":{"lp":<price>,...}}]}
+    """
+    retry_delay = 2
+
+    while True:
+        logger.info("Connecting to TradingView WebSocket ...")
+        try:
+            ws = ws_client.create_connection(
+                TV_WS_URL,
+                header=[f"{k}: {v}" for k, v in TV_HEADERS.items()],
+                timeout=15,
+            )
+
+            qs = "qs_" + _rand_str()   # unique quote-session id
+
+            # Handshake sequence
+            ws.send(_tv_msg("set_auth_token",       ["unauthorized_user_token"]))
+            ws.send(_tv_msg("quote_create_session",  [qs]))
+            ws.send(_tv_msg("quote_set_fields",      [
+                qs, "lp", "lp_time", "volume", "ch", "chp", "bid", "ask",
+            ]))
+            ws.send(_tv_msg("quote_add_symbols",     [
+                qs, TV_SYMBOL, {"flags": ["force_permission"]},
+            ]))
+            ws.send(_tv_msg("quote_fast_symbols",    [qs, TV_SYMBOL]))
+
+            logger.info(f"TradingView WS connected (session={qs})")
+            retry_delay = 2   # reset backoff on successful connect
+
+            while True:
+                raw = ws.recv()
+                if not raw:
+                    continue
+
+                packets = _parse_packets(raw)
+
+                for packet in packets:
+                    if not packet:
+                        continue
+
+                    # Echo heartbeats so the server keeps the connection alive
+                    if packet.startswith("~h~"):
+                        ws.send(_pack(packet))
+                        continue
+
+                    try:
+                        msg = json.loads(packet)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+
+                    # Real-time quote update
+                    if msg.get("m") == "qsd":
+                        p = msg.get("p", [])
+                        if len(p) >= 2:
+                            v  = p[1].get("v", {})
+                            lp = v.get("lp")
+                            if lp is not None:
+                                ts = float(v["lp_time"]) if v.get("lp_time") else time.time()
+                                price_queue.put_nowait({"price": float(lp), "ts": ts})
+
+        except ws_client.WebSocketConnectionClosedException:
+            logger.warning("TradingView WS connection closed")
+        except Exception as exc:
+            logger.error(f"TradingView WS error: {exc}")
+
+        logger.info(f"TradingView WS reconnecting in {retry_delay}s ...")
+        time.sleep(retry_delay)
+        retry_delay = min(retry_delay * 2, 60)
+
 
 # ============================================================
 # SYNTHETIC HISTORY  (warm-start the model before live data)
 # ============================================================
 def generate_synthetic_history(n: int = 60) -> List[dict]:
-    candles = []
-    price = 65_000.0
+    candles, price = [], 65_000.0
     t = time.time() - n * WINDOW_SECONDS
     for i in range(n):
-        o = price + random.gauss(0, 50)
-        c = o + random.gauss(0, 120)
-        h = max(o, c) + abs(random.gauss(0, 25))
+        o  = price + random.gauss(0, 50)
+        c  = o     + random.gauss(0, 120)
+        h  = max(o, c) + abs(random.gauss(0, 25))
         lo = min(o, c) - abs(random.gauss(0, 25))
-        vol = random.uniform(5, 50)
         candles.append({
-            "ts": t + i * WINDOW_SECONDS,
+            "ts":     t + i * WINDOW_SECONDS,
             "open":   round(o,  2),
             "high":   round(h,  2),
             "low":    round(lo, 2),
             "close":  round(c,  2),
-            "volume": round(vol, 4),
+            "volume": round(random.uniform(5, 50), 4),
         })
         price = c
     return candles
+
 
 # ============================================================
 # FEATURE ENGINEERING
@@ -100,20 +232,22 @@ def make_features(candles: List[dict]) -> Optional[pd.DataFrame]:
     if len(candles) < 6:
         return None
     df = pd.DataFrame(candles)
-    df["ret"]      = df["close"].pct_change()
-    df["hl"]       = (df["high"] - df["low"]) / df["close"]
-    df["oc"]       = (df["close"] - df["open"]) / df["open"]
-    df["ma3"]      = df["close"].rolling(3).mean()
-    df["ma5"]      = df["close"].rolling(5).mean()
-    df["ma_diff"]  = (df["ma3"] - df["ma5"]) / df["close"]
-    df["vol_ma3"]  = df["volume"].rolling(3).mean()
-    df["vol_ratio"]= df["volume"] / (df["vol_ma3"] + 1e-9)
-    df["ret_lag1"] = df["ret"].shift(1)
-    df["ret_lag2"] = df["ret"].shift(2)
-    df["momentum"] = df["close"] - df["close"].shift(3)
+    df["ret"]       = df["close"].pct_change()
+    df["hl"]        = (df["high"] - df["low"]) / df["close"]
+    df["oc"]        = (df["close"] - df["open"]) / df["open"]
+    df["ma3"]       = df["close"].rolling(3).mean()
+    df["ma5"]       = df["close"].rolling(5).mean()
+    df["ma_diff"]   = (df["ma3"] - df["ma5"]) / df["close"]
+    df["vol_ma3"]   = df["volume"].rolling(3).mean()
+    df["vol_ratio"] = df["volume"] / (df["vol_ma3"] + 1e-9)
+    df["ret_lag1"]  = df["ret"].shift(1)
+    df["ret_lag2"]  = df["ret"].shift(2)
+    df["momentum"]  = df["close"] - df["close"].shift(3)
     df.dropna(inplace=True)
-    cols = ["ret", "hl", "oc", "ma_diff", "vol_ratio", "ret_lag1", "ret_lag2", "momentum"]
+    cols = ["ret", "hl", "oc", "ma_diff", "vol_ratio",
+            "ret_lag1", "ret_lag2", "momentum"]
     return df[cols] if len(df) >= 1 else None
+
 
 # ============================================================
 # MODEL TRAINING
@@ -123,14 +257,11 @@ def train_model_from_candles(candles: List[dict]) -> None:
     if len(candles) < MIN_CANDLES_TRAIN + 2:
         return
     try:
-        # Build features on all-but-last candle; label = direction of NEXT candle
         features_df = make_features(candles[:-1])
         if features_df is None or len(features_df) == 0:
             return
 
-        n  = len(features_df)
-        # The feature rows align to candles at indices [offset … offset+n-1]
-        # The label for row i is the direction of candles[offset+i+1]
+        n      = len(features_df)
         offset = (len(candles) - 1) - n
 
         labels = []
@@ -147,11 +278,8 @@ def train_model_from_candles(candles: List[dict]) -> None:
         features_df = features_df.iloc[:len(labels)]
 
         clf = xgb.XGBClassifier(
-            n_estimators=60,
-            max_depth=3,
-            learning_rate=0.1,
-            eval_metric="logloss",
-            verbosity=0,
+            n_estimators=60, max_depth=3,
+            learning_rate=0.1, eval_metric="logloss", verbosity=0,
         )
         clf.fit(features_df.values, labels)
 
@@ -160,6 +288,7 @@ def train_model_from_candles(candles: List[dict]) -> None:
         logger.info(f"Model trained on {len(labels)} samples")
     except Exception as exc:
         logger.error(f"Training error: {exc}")
+
 
 # ============================================================
 # PREDICTION
@@ -175,19 +304,21 @@ def predict_from_candles(candles: List[dict]) -> dict:
         if features_df is None or len(features_df) == 0:
             return default
 
-        row  = features_df.iloc[[-1]]
-        prob = mdl.predict_proba(row.values)[0]  # [p_down, p_up]
+        prob = mdl.predict_proba(features_df.iloc[[-1]].values)[0]
         up_p = float(prob[1])
         conf = int(round(max(up_p, 1 - up_p) * 100))
 
         if   up_p > 0.55: signal = "UP"
         elif up_p < 0.45: signal = "DOWN"
-        else:              signal = "HOLD"
+        else:             signal = "HOLD"
 
-        # Next 5-min boundary in GMT+3
         now      = datetime.now(TZ)
         next_min = ((now.minute // 5) + 1) * 5
-        delta    = timedelta(minutes=(next_min - now.minute), seconds=-now.second, microseconds=-now.microsecond)
+        delta    = timedelta(
+            minutes      = next_min - now.minute,
+            seconds      = -now.second,
+            microseconds = -now.microsecond,
+        )
         nxt_time = (now + delta).strftime("%H:%M")
 
         return {"signal": signal, "confidence": conf, "next_window": nxt_time}
@@ -195,8 +326,9 @@ def predict_from_candles(candles: List[dict]) -> dict:
         logger.error(f"Prediction error: {exc}")
         return default
 
+
 # ============================================================
-# CANDLE BUILDING  (called from price_processor_thread)
+# CANDLE BUILDING
 # ============================================================
 def process_price_tick(price: float, trade_ts: float) -> None:
     global live_candle, live_window_start, candles_since_retrain, wins, losses
@@ -205,13 +337,9 @@ def process_price_tick(price: float, trade_ts: float) -> None:
         if live_window_start is None:
             live_window_start = trade_ts - (trade_ts % WINDOW_SECONDS)
 
-        window_end = live_window_start + WINDOW_SECONDS
-
-        if trade_ts >= window_end:
-            # ── close the current window ──────────────────
+        if trade_ts >= live_window_start + WINDOW_SECONDS:
             if live_candle is not None:
                 _close_current_window_locked()
-            # start a fresh window aligned to WINDOW_SECONDS
             live_window_start = trade_ts - (trade_ts % WINDOW_SECONDS)
             live_candle = _new_candle(live_window_start, price)
         elif live_candle is None:
@@ -228,36 +356,34 @@ def _new_candle(ts: float, price: float) -> dict:
 
 
 def _close_current_window_locked() -> None:
-    """Called with state_lock already held."""
+    """Must be called with state_lock held."""
     global live_candle, candles_since_retrain, wins, losses
 
-    candle = dict(live_candle)
-    live_candle = None
+    candle       = dict(live_candle)
+    live_candle  = None
     completed_candles.append(candle)
     candles_since_retrain += 1
 
-    # ── score the previous pending prediction ─────────────
+    # Score the most recent pending prediction
     for row in reversed(history_rows):
         if row.get("actual") == "⏳":
-            actual = "UP" if candle["close"] > candle["open"] else "DOWN"
+            actual           = "UP" if candle["close"] > candle["open"] else "DOWN"
             row["actual"]    = actual
             row["act_open"]  = candle["open"]
             row["act_close"] = candle["close"]
             if row["predicted"] == actual:
-                row["result"] = "✅"
-                wins += 1
+                row["result"] = "✅"; wins   += 1
             else:
-                row["result"] = "❌"
-                losses += 1
+                row["result"] = "❌"; losses += 1
             break
 
-    # ── make a prediction for the new window ──────────────
-    candles_snap = list(completed_candles)
-    pred = predict_from_candles(candles_snap)
+    # New prediction for the window that just opened
+    snap = list(completed_candles)
+    pred = predict_from_candles(snap)
+    dt   = datetime.fromtimestamp(candle["ts"], tz=TZ).strftime("%H:%M")
 
-    dt_str = datetime.fromtimestamp(candle["ts"], tz=TZ).strftime("%H:%M")
     history_rows.append({
-        "window":     dt_str,
+        "window":     dt,
         "predicted":  pred["signal"],
         "confidence": pred["confidence"],
         "act_open":   0.0,
@@ -265,69 +391,20 @@ def _close_current_window_locked() -> None:
         "actual":     "⏳",
         "result":     "⏳",
     })
-    # keep only last HISTORY_LIMIT rows
     del history_rows[:-HISTORY_LIMIT]
 
-    # ── periodic retrain ──────────────────────────────────
     if candles_since_retrain >= RETRAIN_EVERY:
         candles_since_retrain = 0
         threading.Thread(
             target=train_model_from_candles,
-            args=(candles_snap,),
-            daemon=True,
+            args=(snap,), daemon=True,
         ).start()
 
-# ============================================================
-# BINANCE WEBSOCKET  (dedicated daemon thread — simple & reliable)
-# ============================================================
-def binance_ws_thread() -> None:
-    retry_delay = 2
-    url = "wss://stream.binance.com:9443/ws/btcusdt@trade"
-
-    while True:
-        logger.info("Connecting to Binance WebSocket …")
-
-        def on_open(ws_app):
-            logger.info("Binance WS connected ✓")
-
-        def on_message(ws_app, raw):
-            try:
-                data = json.loads(raw)
-                if data.get("e") == "trade":
-                    price_queue.put_nowait({
-                        "price": float(data["p"]),
-                        "ts":    float(data["T"]) / 1000.0,
-                    })
-            except Exception:
-                pass
-
-        def on_error(ws_app, err):
-            logger.error(f"Binance WS error: {err}")
-
-        def on_close(ws_app, code, msg):
-            logger.warning(f"Binance WS closed (code={code})")
-
-        try:
-            app_ws = ws_client.WebSocketApp(
-                url,
-                on_open=on_open,
-                on_message=on_message,
-                on_error=on_error,
-                on_close=on_close,
-            )
-            app_ws.run_forever(ping_interval=20, ping_timeout=10)
-        except Exception as exc:
-            logger.error(f"Binance WS exception: {exc}")
-
-        logger.info(f"Reconnecting in {retry_delay}s …")
-        time.sleep(retry_delay)
-        retry_delay = min(retry_delay * 2, 60)
 
 # ============================================================
 # PRICE PROCESSOR THREAD
 # ============================================================
 def price_processor_thread() -> None:
-    """Drains the price queue and builds 5-min candles."""
     while True:
         try:
             item = price_queue.get(timeout=1.0)
@@ -336,6 +413,7 @@ def price_processor_thread() -> None:
             continue
         except Exception as exc:
             logger.error(f"Price processor error: {exc}")
+
 
 # ============================================================
 # WEBSOCKET BROADCAST
@@ -347,10 +425,8 @@ async def _periodic_broadcast() -> None:
 
 
 async def _broadcast_state() -> None:
-    global _clients_lock
     payload = _build_state_payload()
     msg     = json.dumps(payload)
-
     async with _clients_lock:
         dead = []
         for ws in list(_clients):
@@ -365,23 +441,16 @@ async def _broadcast_state() -> None:
 
 def _build_state_payload() -> dict:
     with state_lock:
-        candles_snap = list(completed_candles)
-        lc           = dict(live_candle) if live_candle else None
-        w, l         = wins, losses
-        rows         = list(history_rows[-5:])
+        snap = list(completed_candles)
+        lc   = dict(live_candle) if live_candle else None
+        w, l = wins, losses
+        rows = list(history_rows[-5:])
 
-    pred = predict_from_candles(candles_snap) if candles_snap else \
-           {"signal": "HOLD", "confidence": 0, "next_window": ""}
-
-    ohlc = {}
-    if lc:
-        ohlc = {k: round(lc[k], 2) for k in ("open", "high", "low", "close")}
-
-    live_price = 0.0
-    if lc:
-        live_price = lc["close"]
-    elif candles_snap:
-        live_price = candles_snap[-1]["close"]
+    pred       = predict_from_candles(snap) if snap else \
+                 {"signal": "HOLD", "confidence": 0, "next_window": ""}
+    ohlc       = ({k: round(lc[k], 2) for k in ("open", "high", "low", "close")}
+                  if lc else {})
+    live_price = lc["close"] if lc else (snap[-1]["close"] if snap else 0.0)
 
     with model_lock:
         model_ready = model is not None
@@ -398,8 +467,9 @@ def _build_state_payload() -> dict:
         "model_ready": model_ready,
     }
 
+
 # ============================================================
-# HTML FRONTEND  (layout & styling unchanged)
+# HTML FRONTEND
 # ============================================================
 HTML_CONTENT = """<!DOCTYPE html>
 <html lang="en">
@@ -494,8 +564,9 @@ HTML_CONTENT = """<!DOCTYPE html>
       </div>
     </div>
     <div class="card">
-      <div class="card-title">Model Status</div>
+      <div class="card-title">Data Source</div>
       <div id="model-status" style="color:#F7931A;font-size:.85rem">&#8987; Collecting data...</div>
+      <div style="color:#4A6080;font-size:.75rem;margin-top:8px;">&#128250; TradingView &mdash; BINANCE:BTCUSDT</div>
     </div>
   </div>
 
@@ -521,8 +592,9 @@ HTML_CONTENT = """<!DOCTYPE html>
 
 <script src="https://s3.tradingview.com/tv.js"></script>
 <script>
+  // Chart widget uses same symbol as backend data feed
   new TradingView.widget({
-    container_id:'tv-widget', symbol:'BITSTAMP:BTCUSD', interval:'5',
+    container_id:'tv-widget', symbol:'BINANCE:BTCUSDT', interval:'5',
     theme:'dark', style:'1', locale:'en', toolbar_bg:'#080C14',
     enable_publishing:false, autosize:true
   });
@@ -545,7 +617,7 @@ HTML_CONTENT = """<!DOCTYPE html>
   function connect() {
     var wsUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws';
     ws = new WebSocket(wsUrl);
-    ws.onopen = function() {
+    ws.onopen  = function() {
       document.getElementById('ws-dot').className = 'dot dot-ok';
       document.getElementById('ws-txt').textContent = 'Live';
     };
@@ -565,7 +637,6 @@ HTML_CONTENT = """<!DOCTYPE html>
   function handleState(d) {
     if (d.type === 'ping') return;
 
-    // ── Live price ────────────────────────────────────────
     var p = d.price;
     if (p && p > 0) {
       document.getElementById('live-price').textContent = fmt(p);
@@ -577,23 +648,20 @@ HTML_CONTENT = """<!DOCTYPE html>
       chgEl.style.color = chg >= 0 ? '#00E5A0' : '#FF4560';
     }
 
-    // ── Signal ────────────────────────────────────────────
-    var sig   = d.signal || 'HOLD';
-    var isUp  = sig === 'UP';
-    var isDn  = sig === 'DOWN';
-    var col   = isUp ? '#00E5A0' : isDn ? '#FF4560' : '#4A6080';
-    document.getElementById('pred-arrow').textContent  = isUp ? '▲' : isDn ? '▼' : '◆';
-    document.getElementById('pred-arrow').style.color  = col;
-    document.getElementById('pred-dir').textContent    = isUp ? 'UP' : isDn ? 'DOWN' : 'HOLD';
-    document.getElementById('pred-dir').style.color    = col;
-    document.getElementById('conf-pct').textContent    = (isUp || isDn) ? d.confidence + '%' : '--%';
-    document.getElementById('conf-pct').style.color    = col;
-    document.getElementById('conf-bar').style.width    = (d.confidence || 0) + '%';
+    var sig  = d.signal || 'HOLD';
+    var isUp = sig === 'UP', isDn = sig === 'DOWN';
+    var col  = isUp ? '#00E5A0' : isDn ? '#FF4560' : '#4A6080';
+    document.getElementById('pred-arrow').textContent = isUp ? '▲' : isDn ? '▼' : '◆';
+    document.getElementById('pred-arrow').style.color = col;
+    document.getElementById('pred-dir').textContent   = isUp ? 'UP' : isDn ? 'DOWN' : 'HOLD';
+    document.getElementById('pred-dir').style.color   = col;
+    document.getElementById('conf-pct').textContent   = (isUp||isDn) ? d.confidence+'%' : '--%';
+    document.getElementById('conf-pct').style.color   = col;
+    document.getElementById('conf-bar').style.width   = (d.confidence||0) + '%';
     document.getElementById('conf-bar').style.background = col;
     document.getElementById('pred-window').textContent =
       d.next_window ? 'Next: ' + d.next_window : '';
 
-    // ── OHLC ─────────────────────────────────────────────
     if (d.ohlc) {
       document.getElementById('o-open').textContent  = fmt(d.ohlc.open);
       document.getElementById('o-high').textContent  = fmt(d.ohlc.high);
@@ -601,41 +669,35 @@ HTML_CONTENT = """<!DOCTYPE html>
       document.getElementById('o-close').textContent = fmt(d.ohlc.close);
     }
 
-    // ── Performance ───────────────────────────────────────
-    var w = d.wins || 0, l = d.losses || 0, tot = w + l;
+    var w = d.wins||0, l = d.losses||0, tot = w+l;
     document.getElementById('p-wins').textContent   = w;
     document.getElementById('p-losses').textContent = l;
-    document.getElementById('p-acc').textContent    = tot ? (w / tot * 100).toFixed(1) + '%' : '--%';
+    document.getElementById('p-acc').textContent    = tot ? (w/tot*100).toFixed(1)+'%' : '--%';
 
-    // ── Model status ──────────────────────────────────────
     var msEl = document.getElementById('model-status');
     if (d.model_ready) {
-      msEl.textContent    = '✅ Model active';
-      msEl.style.color    = '#00E5A0';
+      msEl.textContent = '&#10003; Model active';
+      msEl.style.color = '#00E5A0';
     } else {
-      msEl.textContent    = '⏳ Collecting data...';
-      msEl.style.color    = '#F7931A';
+      msEl.textContent = '&#8987; Collecting data...';
+      msEl.style.color = '#F7931A';
     }
 
-    // ── History table ─────────────────────────────────────
     var tbody = document.getElementById('history-body');
     if (d.table && d.table.length) {
       tbody.innerHTML = d.table.map(function(r) {
-        var predCls = r.predicted === 'UP' ? 'up' : r.predicted === 'DOWN' ? 'down' : '';
-        var actCls  = r.actual    === 'UP' ? 'up' : r.actual    === 'DOWN' ? 'down' : '';
-        var predTxt = r.predicted === 'UP' ? '▲ UP' : r.predicted === 'DOWN' ? '▼ DOWN' : r.predicted;
-        var actTxt  = r.actual === '⏳' ? '--' :
-                      r.actual === 'UP' ? '▲ UP' :
-                      r.actual === 'DOWN' ? '▼ DOWN' : r.actual;
-        var res     = r.result === '⏳' ? '--' : r.result;
+        var predCls = r.predicted==='UP'?'up':r.predicted==='DOWN'?'down':'';
+        var actCls  = r.actual==='UP'?'up':r.actual==='DOWN'?'down':'';
+        var predTxt = r.predicted==='UP'?'&#9650; UP':r.predicted==='DOWN'?'&#9660; DOWN':r.predicted;
+        var actTxt  = r.actual==='⏳'?'--':r.actual==='UP'?'&#9650; UP':r.actual==='DOWN'?'&#9660; DOWN':r.actual;
         return '<tr>' +
-          '<td style="color:#4A6080">'  + r.window     + '</td>' +
-          '<td class="' + predCls + '">'+ predTxt      + '</td>' +
-          '<td style="color:#F7931A">'  + r.confidence + '%</td>' +
-          '<td>'                        + fmt(r.act_open)  + '</td>' +
-          '<td>'                        + fmt(r.act_close) + '</td>' +
-          '<td class="' + actCls + '">' + actTxt       + '</td>' +
-          '<td>'                        + res          + '</td>' +
+          '<td style="color:#4A6080">'   + r.window      + '</td>' +
+          '<td class="' + predCls + '">' + predTxt       + '</td>' +
+          '<td style="color:#F7931A">'   + r.confidence  + '%</td>' +
+          '<td>'                         + fmt(r.act_open)  + '</td>' +
+          '<td>'                         + fmt(r.act_close) + '</td>' +
+          '<td class="' + actCls + '">'  + actTxt        + '</td>' +
+          '<td>'                         + (r.result==='⏳'?'--':r.result) + '</td>' +
           '</tr>';
       }).join('');
     } else {
@@ -655,10 +717,10 @@ HTML_CONTENT = """<!DOCTYPE html>
 @asynccontextmanager
 async def lifespan(application: FastAPI):
     global _main_loop, _clients_lock
-    _main_loop   = asyncio.get_running_loop()
-    _clients_lock = asyncio.Lock()          # created in the running loop ✓
+    _main_loop    = asyncio.get_running_loop()
+    _clients_lock = asyncio.Lock()          # created inside running loop
 
-    # ── Warm-start: synthetic candles + initial model ─────
+    # Warm-start: synthetic candles + first model train
     synth = generate_synthetic_history()
     with state_lock:
         for c in synth:
@@ -666,22 +728,21 @@ async def lifespan(application: FastAPI):
     threading.Thread(
         target=train_model_from_candles,
         args=(list(completed_candles),),
-        daemon=True,
-        name="initial-train",
+        daemon=True, name="initial-train",
     ).start()
 
-    # ── Background threads ────────────────────────────────
-    threading.Thread(target=binance_ws_thread,    name="binance-ws",  daemon=True).start()
+    # Background threads
+    threading.Thread(target=tradingview_ws_thread,  name="tv-ws",     daemon=True).start()
     threading.Thread(target=price_processor_thread, name="price-proc", daemon=True).start()
 
-    # ── Async broadcast task ─────────────────────────────
+    # Async broadcast task
     asyncio.create_task(_periodic_broadcast())
 
     logger.info("=" * 54)
-    logger.info("BTC Predictor ready  —  Binance live feed active")
+    logger.info("BTC Predictor ready  —  TradingView live feed active")
+    logger.info(f"Symbol: {TV_SYMBOL}")
     logger.info("=" * 54)
     yield
-    # (cleanup on shutdown if needed)
 
 
 app = FastAPI(lifespan=lifespan)
@@ -697,18 +758,12 @@ async def ws_endpoint(websocket: WebSocket):
     await websocket.accept()
     async with _clients_lock:
         _clients.append(websocket)
-    logger.info(f"WS client connected  — total: {len(_clients)}")
-
+    logger.info(f"WS client connected — total: {len(_clients)}")
     try:
-        # Send current state immediately on connect
         await websocket.send_text(json.dumps(_build_state_payload()))
-
-        # Keep the connection alive; broadcast loop handles data pushes
         while True:
             await asyncio.sleep(20)
-            # Render proxy keepalive ping
-            await websocket.send_text(json.dumps({"type": "ping"}))
-
+            await websocket.send_text(json.dumps({"type": "ping"}))   # Render keepalive
     except WebSocketDisconnect:
         pass
     except Exception:
