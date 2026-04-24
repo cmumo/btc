@@ -777,7 +777,10 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 
   // ── WebSocket ───────────────────────────────────────────────
   function connect() {
-    ws = new WebSocket(`ws://${location.host}/ws`);
+    // FIX: Use wss:// for secure WebSocket on Render HTTPS
+    const protocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+    ws = new WebSocket(`${protocol}${location.host}/ws`);
+    
     ws.onopen  = () => {
       document.getElementById('ws-dot').className = 'dot dot-ok';
       document.getElementById('ws-txt').textContent = 'Live';
