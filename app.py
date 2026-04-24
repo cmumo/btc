@@ -4,17 +4,18 @@ Bitcoin 5-Minute Prediction Terminal - RENDER READY
 - TradingView chart (BITSTAMP:BTCUSD) + Binance WebSocket for live prices
 - XGBoost model, 5-min candles, win/loss tracking
 - GMT+3 timezone, prices with 2 decimal places
+- Correct port binding for Render ($PORT)
 - WebSocket keepalive to prevent Render proxy timeout
 """
 
 import asyncio
 import json
 import logging
+import os
 import random
 import string
 import threading
 import time
-import os
 from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
@@ -26,11 +27,11 @@ import pandas as pd
 import websocket as ws_client
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
-from xgboost import XGBClassifier
 from sklearn.preprocessing import StandardScaler
-from ta.momentum import RSIIndicator, StochasticOscillator
-from ta.trend import MACD, ADXIndicator
+from ta.momentum import RSIIndicator
+from ta.trend import MACD
 from ta.volatility import BollingerBands, AverageTrueRange
+from xgboost import XGBClassifier
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -41,12 +42,12 @@ TZ_OFFSET = timedelta(hours=3)
 # ─────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────
-WINDOW_SECONDS  = 300
-MAX_BUFFER      = 500
-RETRAIN_EVERY   = 10
-MIN_TRAIN_ROWS  = 40
+WINDOW_SECONDS = 300
+MAX_BUFFER = 500
+RETRAIN_EVERY = 10
+MIN_TRAIN_ROWS = 40
 HISTORICAL_ROWS = 800
-HISTORY_LIMIT   = 5
+HISTORY_LIMIT = 5
 
 # ─────────────────────────────────────────────
 # SHARED STATE
@@ -93,12 +94,12 @@ def aligned_window(ts: float) -> int:
     return int(ts) - (int(ts) % WINDOW_SECONDS)
 
 def window_label(start_ts: int) -> str:
-    dt = datetime.utcfromtimestamp(start_ts) + timedelta(hours=3)
+    dt = datetime.utcfromtimestamp(start_ts) + TZ_OFFSET
     end = dt + timedelta(seconds=WINDOW_SECONDS)
     return f"{dt.strftime('%H:%M')}-{end.strftime('%H:%M')}"
 
 # ============================================================
-# FEATURE ENGINEERING (simplified for brevity - same logic)
+# FEATURE ENGINEERING
 # ============================================================
 def build_feature_df(candles: list) -> pd.DataFrame:
     if len(candles) < 30:
@@ -127,7 +128,7 @@ def create_labels(df: pd.DataFrame, future_periods: int = 1) -> pd.Series:
     return (future_ret > 0.0005).astype(int)
 
 # ============================================================
-# SYNTHETIC HISTORY
+# SYNTHETIC HISTORY (for warm‑up)
 # ============================================================
 def generate_synthetic_history(n: int = HISTORICAL_ROWS, base_price: float = 65000.0) -> list:
     logger.info(f"Generating {n} synthetic candles...")
@@ -144,9 +145,13 @@ def generate_synthetic_history(n: int = HISTORICAL_ROWS, base_price: float = 650
         h = max(o, c) * (1 + abs(rng.normal(0, 0.001)))
         l = min(o, c) * (1 - abs(rng.normal(0, 0.001)))
         candles.append({
-            "window_start": ts, "label": window_label(ts),
-            "open": round(o, 2), "high": round(h, 2), "low": round(l, 2),
-            "close": round(c, 2), "volume": float(rng.integers(500, 8000))
+            "window_start": ts,
+            "label": window_label(ts),
+            "open": round(o, 2),
+            "high": round(h, 2),
+            "low": round(l, 2),
+            "close": round(c, 2),
+            "volume": float(rng.integers(500, 8000))
         })
     return candles
 
@@ -224,10 +229,14 @@ def process_price_tick(price: float, trade_ts: float) -> None:
 
 def _new_candle(window_start: int, open_price: float) -> dict:
     return {
-        "window_start": window_start, "label": window_label(window_start),
-        "open": round(open_price, 2), "high": round(open_price, 2),
-        "low": round(open_price, 2), "close": round(open_price, 2),
-        "volume": 0.0, "ticks": 0,
+        "window_start": window_start,
+        "label": window_label(window_start),
+        "open": round(open_price, 2),
+        "high": round(open_price, 2),
+        "low": round(open_price, 2),
+        "close": round(open_price, 2),
+        "volume": 0.0,
+        "ticks": 0,
     }
 
 def _close_current_window() -> None:
@@ -277,13 +286,16 @@ def _close_current_window() -> None:
         "predicted": pred_result["direction"],
         "confidence": pred_result["confidence"],
         "signal": pred_result["signal"],
-        "actual": "⏳", "result": "⏳", "act_open": None, "act_close": None,
+        "actual": "⏳",
+        "result": "⏳",
+        "act_open": None,
+        "act_close": None,
     })
     if len(history_rows) > HISTORY_LIMIT:
         history_rows[:] = history_rows[:HISTORY_LIMIT]
 
 # ============================================================
-# BINANCE WEBSOCKET - REAL TIME TRADES
+# BINANCE WEBSOCKET (real‑time trades)
 # ============================================================
 def binance_ws_thread() -> None:
     retry_delay = 2
@@ -371,13 +383,36 @@ def _build_state_payload() -> dict:
         else:
             secs_left, window_pct, next_label = float(WINDOW_SECONDS), 0.0, "--"
         lc = live_candle or {}
-        table = [{"window": r["predicted_window_label"], "predicted": r["predicted"], "confidence": r["confidence"], "actual": r["actual"], "result": r["result"], "act_open": r["act_open"], "act_close": r["act_close"]} for r in history_rows[:HISTORY_LIMIT]]
+        table = [
+            {
+                "window": r["predicted_window_label"],
+                "predicted": r["predicted"],
+                "confidence": r["confidence"],
+                "actual": r["actual"],
+                "result": r["result"],
+                "act_open": r["act_open"],
+                "act_close": r["act_close"],
+            }
+            for r in history_rows[:HISTORY_LIMIT]
+        ]
         return {
-            "price": round(latest_price, 2), "next_window": next_label, "secs_left": round(secs_left, 1),
-            "window_pct": round(window_pct * 100, 1), "signal": pred_now.get("direction", "HOLD"),
-            "confidence": pred_now.get("confidence", 0), "wins": wins, "losses": losses, "accuracy": acc,
-            "trained": trained, "ohlc": {"open": lc.get("open", 0), "high": lc.get("high", 0),
-            "low": lc.get("low", 0), "close": lc.get("close", 0)}, "table": table,
+            "price": round(latest_price, 2) if latest_price > 0 else None,
+            "next_window": next_label,
+            "secs_left": round(secs_left, 1),
+            "window_pct": round(window_pct * 100, 1),
+            "signal": pred_now.get("direction", "HOLD"),
+            "confidence": pred_now.get("confidence", 0),
+            "wins": wins,
+            "losses": losses,
+            "accuracy": acc,
+            "trained": trained,
+            "ohlc": {
+                "open": lc.get("open", 0),
+                "high": lc.get("high", 0),
+                "low": lc.get("low", 0),
+                "close": lc.get("close", 0),
+            },
+            "table": table,
         }
 
 # ============================================================
@@ -461,10 +496,10 @@ HTML_CONTENT = """
     <div class="card"><div class="card-title">Current Window</div><div class="ohlc-grid"><div class="ohlc-cell"><div class="lbl">Open</div><div id="o-open">--</div></div><div class="ohlc-cell"><div class="lbl">High</div><div id="o-high" class="up">--</div></div><div class="ohlc-cell"><div class="lbl">Low</div><div id="o-low" class="down">--</div></div><div class="ohlc-cell"><div class="lbl">Close</div><div id="o-close">--</div></div></div></div>
     <div class="card"><div class="card-title">Performance</div><div class="perf-row"><div class="perf-stat"><div class="perf-num up" id="p-wins">0</div><div class="perf-lbl">Wins</div></div><div class="perf-stat"><div class="perf-num down" id="p-losses">0</div><div class="perf-lbl">Losses</div></div><div class="perf-stat"><div class="perf-num" id="p-acc" style="color:#F7931A">--%</div><div class="perf-lbl">Accuracy</div></div></div></div>
   </div>
-  <div class="card"><div class="card-title">Prediction History (last 5)</div><div class="table-wrapper"><table><thead><tr><th>Window</th><th>Prediction</th><th>Conf</th><th>Act.Open</th><th>Act.Close</th><th>Actual</th><th>Result</th></tr></thead><tbody id="history-body"><tr><td colspan="7" style="text-align:center;padding:20px;">Waiting for data...</td></tr></tbody></table></div></div>
-  <div class="disclaimer">⚠️ For educational purpose only. Past accuracy does not guarantee future results.</div>
-</div>
-<script src="https://s3.tradingview.com/tv.js"></script>
+  <div class="card"><div class="card-title">Prediction History (last 5)</div><div class="table-wrapper"><table><thead><tr><th>Window</th><th>Prediction</th><th>Conf</th><th>Act.Open</th><th>Act.Close</th><th>Actual</th><th>Result</th></tr></thead><tbody id="history-body"><tr><td colspan="7" style="text-align:center;padding:20px;">Waiting for data...<\/td><\/tr><\/tbody><\/table><\/div><\/div>
+  <div class="disclaimer">⚠️ For educational purpose only. Past accuracy does not guarantee future results.<\/div>
+<\/div>
+<script src="https:\/\/s3.tradingview.com\/tv.js"><\/script>
 <script>
   new TradingView.widget({container_id:'tv-widget',symbol:'BITSTAMP:BTCUSD',interval:'5',theme:'dark',style:'1',locale:'en',toolbar_bg:'#080C14',enable_publishing:false,autosize:true});
   let ws, firstPrice=null, prevPrice=null;
@@ -473,7 +508,7 @@ HTML_CONTENT = """
   updateClock();setInterval(updateClock,1000);
   function fmt(n){if(n==null||n===0)return'--';return '$'+n.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});}
   function connect(){
-    const wsUrl=(location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws';
+    const wsUrl=(location.protocol==='https:'?'wss:\/\/':'ws:\/\/')+location.host+'\/ws';
     ws=new WebSocket(wsUrl);
     ws.onopen=()=>{document.getElementById('ws-dot').className='dot dot-ok';document.getElementById('ws-txt').textContent='Live';};
     ws.onclose=()=>{document.getElementById('ws-dot').className='dot dot-bad';document.getElementById('ws-txt').textContent='Disconnected';setTimeout(connect,3000);};
@@ -486,12 +521,12 @@ HTML_CONTENT = """
     const sig=d.signal||'HOLD';const isUp=sig==='UP',isDn=sig==='DOWN';const col=isUp?'#00E5A0':isDn?'#FF4560':'#4A6080';document.getElementById('pred-arrow').textContent=isUp?'▲':isDn?'▼':'◆';document.getElementById('pred-arrow').style.color=col;document.getElementById('pred-dir').textContent=isUp?'UP':isDn?'DOWN':'HOLD';document.getElementById('pred-dir').style.color=col;document.getElementById('conf-pct').textContent=(isUp||isDn)?d.confidence+'%':'--%';document.getElementById('conf-pct').style.color=col;document.getElementById('conf-bar').style.width=(d.confidence||0)+'%';document.getElementById('conf-bar').style.background=col;document.getElementById('pred-window').textContent=d.next_window?`Next: ${d.next_window}`:'';
     if(d.ohlc){document.getElementById('o-open').textContent=fmt(d.ohlc.open);document.getElementById('o-high').textContent=fmt(d.ohlc.high);document.getElementById('o-low').textContent=fmt(d.ohlc.low);document.getElementById('o-close').textContent=fmt(d.ohlc.close);}
     const wins=d.wins||0,losses=d.losses||0,total=wins+losses,acc=total?(wins/total*100).toFixed(1)+'%':'--%';document.getElementById('p-wins').textContent=wins;document.getElementById('p-losses').textContent=losses;document.getElementById('p-acc').textContent=acc;
-    const tbody=document.getElementById('history-body');if(d.table&&d.table.length){tbody.innerHTML=d.table.map(r=>{const predCls=r.predicted==='UP'?'up':r.predicted==='DOWN'?'down':'';const actCls=r.actual==='UP'?'up':r.actual==='DOWN'?'down':'';const predTxt=r.predicted==='UP'?'▲ UP':r.predicted==='DOWN'?'▼ DOWN':r.predicted;const actTxt=r.actual==='⏳'?'--':r.actual==='UP'?'▲ UP':r.actual==='DOWN'?'▼ DOWN':r.actual;return `<tr><td style="color:#4A6080">${r.window}</td><td class="${predCls}">${predTxt}</td><td style="color:#F7931A">${r.confidence}%</td><td>${fmt(r.act_open)}</td><td>${fmt(r.act_close)}</td><td class="${actCls}">${actTxt}</td><td>${r.result==='⏳'?'--':r.result}</td></tr>`;}).join('');}else{tbody.innerHTML='<tr><td colspan="7" style="text-align:center;padding:20px;">Waiting for data...</td></tr>';}
+    const tbody=document.getElementById('history-body');if(d.table&&d.table.length){tbody.innerHTML=d.table.map(r=>{const predCls=r.predicted==='UP'?'up':r.predicted==='DOWN'?'down':'';const actCls=r.actual==='UP'?'up':r.actual==='DOWN'?'down':'';const predTxt=r.predicted==='UP'?'▲ UP':r.predicted==='DOWN'?'▼ DOWN':r.predicted;const actTxt=r.actual==='⏳'?'--':r.actual==='UP'?'▲ UP':r.actual==='DOWN'?'▼ DOWN':r.actual;return `<tr><td style="color:#4A6080">${r.window}<\/td><td class="${predCls}">${predTxt}<\/td><td style="color:#F7931A">${r.confidence}%<\/td><td>${fmt(r.act_open)}<\/td><td>${fmt(r.act_close)}<\/td><td class="${actCls}">${actTxt}<\/td><td>${r.result==='⏳'?'--':r.result}<\/td><\/tr>`;}).join('');}else{tbody.innerHTML='<tr><td colspan="7" style="text-align:center;padding:20px;">Waiting for data...<\/td><\/tr>';}
   }
   connect();
-</script>
-</body>
-</html>
+<\/script>
+<\/body>
+<\/html>
 """
 
 # ============================================================
@@ -509,9 +544,9 @@ async def lifespan(application: FastAPI):
     threading.Thread(target=binance_ws_thread, daemon=True).start()
     threading.Thread(target=price_processor_thread, daemon=True).start()
     asyncio.create_task(_periodic_broadcast())
-    logger.info("="*52)
+    logger.info("=" * 52)
     logger.info("BTC Predictor ready - Binance live feed + WebSocket keepalive active")
-    logger.info("="*52)
+    logger.info("=" * 52)
     yield
 
 app = FastAPI(title="BTC Predictor", lifespan=lifespan)
@@ -543,7 +578,11 @@ async def ws_endpoint(websocket: WebSocket):
                 ws_clients.remove(websocket)
         logger.info(f"Client disconnected. Total: {len(ws_clients)}")
 
+# ============================================================
+# ENTRY POINT - RENDER PORT BINDING
+# ============================================================
 if __name__ == "__main__":
     import uvicorn
+    # The CRITICAL line for Render: bind to the PORT environment variable
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
