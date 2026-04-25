@@ -1,37 +1,45 @@
 """
-Bitcoin 5-Minute Prediction Terminal
-=====================================
-- TradingView chart (BITSTAMP:BTCUSD) + Coinbase WebSocket for live prices
-- Hybrid ensemble: LSTM + GRU-Attention (TFT-inspired) + XGBoost
-- SQLite database for persistent storage
-- GMT+3 timezone, prices with 2 decimal places
-- Fully responsive for mobile devices
+Bitcoin 5-Minute Prediction Terminal  ·  v3.0  (Upgraded Ensemble)
+====================================================================
+Architecture
+─────────────
+1. BiLSTM  (bidirectional, 2-layer, hidden=64)
+     Reads the sequence forward AND backward → richer temporal context.
 
-ML Architecture
----------------
-1. LSTM (2-layer, hidden=64)
-     Captures sequential price memory across time steps.
+2. AttentionGRU  (2-layer GRU + 4-head multi-head self-attention + residual)
+     TFT-inspired: learns WHICH past timesteps matter most.
 
-2. GRU-Attention / TFT-inspired (2-layer GRU + 4-head self-attention + residual norm)
-     Learns WHICH past timesteps matter most for the current prediction.
-     This is the core idea behind Temporal Fusion Transformers.
+3. XGBoost  (n=200, depth=5, recency-weighted)
+     Non-linear feature interactions & momentum signals.
 
-3. XGBoost (n=150, depth=4)
-     Handles non-sequential feature interactions and momentum signals.
+4. RandomForest  (n=200 trees)
+     Diverse bagged trees — low correlation with XGBoost boosts ensemble.
 
-4. Weighted soft voting ensemble
-     LSTM 35% · GRU-Attn 35% · XGBoost 30%
-     Adaptive: weights shift toward whichever model is available each cycle.
+5. LightGBM  (n=300, depth=6)
+     Fast leaf-wise boosting, strong complement to XGBoost.
 
-Feature Set (27 engineered features per candle)
------------------------------------------------
+Adaptive Ensemble
+──────────────────
+Each model's voting weight = rolling accuracy over the last 20 resolved
+predictions.  The best model at any given moment carries more weight.
+Base weights are used until 20 resolved predictions exist.
+
+HOLD fix
+─────────
+• HOLD predictions show "--" confidence.
+• HOLD predictions are NEVER evaluated for wins / losses.
+• Accuracy denominates only UP/DOWN predictions that resolved.
+
+Feature Set  (32 engineered features per candle)
+─────────────────────────────────────────────────
 Price structure : ret, hl, oc, body_ratio, upper_wick, lower_wick, is_bullish
-Trend           : ema_diff (EMA9-EMA21), price_vs_ema9, ma_diff (MA3-MA5), price_vs_ma10
-Momentum        : RSI-14 (normalised), MACD, MACD histogram, ROC-5, momentum-3
-Volatility      : ATR-10, Bollinger %B, Bollinger width, rolling_vol-5
-Volume          : vol_ratio (vs 3-bar MA), vol_trend (3-bar vs 10-bar MA)
+Trend           : ema_diff, price_vs_ema9, ma_diff, price_vs_ma10
+Momentum        : rsi_norm, macd, macd_hist, roc5, momentum3_norm
+Volatility      : atr, bb_pct, bb_width, volatility
+Volume          : vol_ratio, vol_trend
 Lags            : ret_lag1, ret_lag2, ret_lag3
-Time            : hour_sin, hour_cos  (intraday seasonality)
+Time            : hour_sin, hour_cos
+VMD-inspired    : trend_component, residual_component, trend_slope, residual_energy
 """
 
 import asyncio
@@ -58,8 +66,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import TensorDataset, DataLoader
 from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestClassifier
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
+
+try:
+    import lightgbm as lgb
+    HAS_LGB = True
+except ImportError:
+    HAS_LGB = False
+    logging.warning("LightGBM not installed — will be skipped in ensemble")
 
 # ============================================================
 # LOGGING
@@ -71,12 +87,12 @@ logger = logging.getLogger(__name__)
 # CONSTANTS
 # ============================================================
 WINDOW_SECONDS     = 300
-HISTORY_LIMIT      = 200      # More history for better training
-MIN_CANDLES_TRAIN  = 30       # Minimum for XGBoost
-MIN_CANDLES_DEEP   = 55       # Minimum for LSTM / GRU-Attn (need SEQ_LEN warm-up)
-RETRAIN_EVERY      = 3        # Retrain more frequently to stay adaptive
-SEQ_LEN            = 20       # Lookback window: 20 x 5 min = 100 min
-N_FEATURES         = 27       # Number of engineered features (must match FEATURE_COLS)
+HISTORY_LIMIT      = 250
+MIN_CANDLES_TRAIN  = 35
+MIN_CANDLES_DEEP   = 60
+RETRAIN_EVERY      = 3
+SEQ_LEN            = 20
+N_FEATURES         = 31          # Must match FEATURE_COLS length
 LSTM_HIDDEN        = 64
 LSTM_LAYERS        = 2
 GRU_HIDDEN         = 64
@@ -89,19 +105,19 @@ TRAIN_LR           = 0.001
 TRAIN_BATCH        = 16
 TZ                 = timezone(timedelta(hours=3))  # GMT+3
 
-# Signal thresholds — higher bar = fewer but higher-quality signals
 SIGNAL_UP_THRESH   = 0.60
 SIGNAL_DOWN_THRESH = 0.40
 
-# Base ensemble weights [lstm, gru_attn, xgb]
-BASE_WEIGHTS: List[float] = [0.35, 0.35, 0.30]
+# Base weights  [bilstm, attn_gru, xgb, rf, lgb]
+BASE_WEIGHTS: List[float] = [0.25, 0.25, 0.20, 0.15, 0.15]
+# Rolling window for adaptive weight calculation
+ADAPTIVE_WINDOW    = 20
 
-# Database
 DB_PATH = os.environ.get("DATABASE_PATH", "/data/predictions.db")
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 logger.info(f"Database path: {DB_PATH}")
 
-torch.set_num_threads(2)   # Polite CPU usage in shared environments
+torch.set_num_threads(2)
 
 # ============================================================
 # DATABASE SETUP
@@ -132,6 +148,7 @@ def init_database():
     conn.close()
     logger.info(f"Database initialised at {DB_PATH}")
 
+
 def save_candle(candle: dict):
     conn = sqlite3.connect(DB_PATH)
     try:
@@ -145,6 +162,7 @@ def save_candle(candle: dict):
     finally:
         conn.close()
 
+
 def load_candles(limit: int = HISTORY_LIMIT) -> List[dict]:
     conn = sqlite3.connect(DB_PATH)
     rows = conn.execute(
@@ -154,6 +172,7 @@ def load_candles(limit: int = HISTORY_LIMIT) -> List[dict]:
     return [{"ts": r[0], "open": r[1], "high": r[2],
              "low": r[3], "close": r[4], "volume": r[5]}
             for r in reversed(rows)]
+
 
 def save_prediction(p: dict):
     conn = sqlite3.connect(DB_PATH)
@@ -169,6 +188,7 @@ def save_prediction(p: dict):
     finally:
         conn.close()
 
+
 def update_prediction_result(ws, we, actual, ao, ac, result):
     conn = sqlite3.connect(DB_PATH)
     try:
@@ -180,6 +200,7 @@ def update_prediction_result(ws, we, actual, ao, ac, result):
         logger.error(f"update_prediction_result: {e}")
     finally:
         conn.close()
+
 
 def load_predictions(limit: int = 5) -> List[dict]:
     conn = sqlite3.connect(DB_PATH)
@@ -196,6 +217,7 @@ def load_predictions(limit: int = 5) -> List[dict]:
         "result": r[7] if r[7] else "⏳",
     } for r in rows]
 
+
 def save_model(obj, wins: int, losses: int):
     conn = sqlite3.connect(DB_PATH)
     try:
@@ -210,6 +232,7 @@ def save_model(obj, wins: int, losses: int):
     finally:
         conn.close()
 
+
 def load_model():
     conn = sqlite3.connect(DB_PATH)
     row = conn.execute('SELECT model_data,wins,losses FROM model WHERE id=1').fetchone()
@@ -223,6 +246,7 @@ def load_model():
             logger.error(f"load_model: {e}")
     return None, 0, 0
 
+
 def save_stats(wins: int, losses: int):
     conn = sqlite3.connect(DB_PATH)
     conn.execute('INSERT OR REPLACE INTO stats (key,value) VALUES (?,?)', ("wins",   wins))
@@ -230,12 +254,14 @@ def save_stats(wins: int, losses: int):
     conn.commit()
     conn.close()
 
+
 def load_stats():
     conn = sqlite3.connect(DB_PATH)
     rows = conn.execute('SELECT key,value FROM stats').fetchall()
     conn.close()
     d = dict(rows)
     return d.get("wins", 0), d.get("losses", 0)
+
 
 # ============================================================
 # SHARED STATE
@@ -249,6 +275,10 @@ wins:                  int = 0
 losses:                int = 0
 candles_since_retrain: int = 0
 
+# Per-model rolling accuracy tracking  [bilstm, attn_gru, xgb, rf, lgb]
+# Each entry: (predicted_class, actual_class)
+model_result_history:  List[List[Tuple[int,int]]] = [[] for _ in range(5)]
+
 model      = None
 model_lock = threading.Lock()
 price_queue: Queue = Queue()
@@ -257,6 +287,7 @@ _clients:      List[WebSocket]                     = []
 _clients_lock: Optional[asyncio.Lock]              = None
 _main_loop:    Optional[asyncio.AbstractEventLoop] = None
 
+
 # ============================================================
 # HELPERS
 # ============================================================
@@ -264,8 +295,9 @@ def get_window_time_range(timestamp: float) -> Tuple[str, str]:
     dt = datetime.fromtimestamp(timestamp, tz=TZ)
     return dt.strftime("%H:%M"), (dt + timedelta(minutes=5)).strftime("%H:%M")
 
+
 # ============================================================
-# SYNTHETIC HISTORY (for cold start)
+# SYNTHETIC HISTORY
 # ============================================================
 def generate_synthetic_history(n: int = 80) -> List[dict]:
     candles, price = [], 65_000.0
@@ -284,52 +316,68 @@ def generate_synthetic_history(n: int = 80) -> List[dict]:
         price = c
     return candles
 
+
 # ============================================================
-# ENHANCED FEATURE ENGINEERING  (27 features)
+# VMD-INSPIRED DECOMPOSITION HELPERS
+# ============================================================
+def _vmd_decompose(prices: np.ndarray, window: int = 10) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Lightweight VMD-inspired decomposition using a rolling mean as the
+    'trend' component and the deviation as the 'residual/oscillatory'
+    component. True VMD requires expensive iterative optimisation;
+    this approximation captures the same structural insight at negligible
+    cost.
+
+    Returns trend and residual arrays of the same length as prices.
+    """
+    trend = pd.Series(prices).rolling(window, min_periods=1).mean().values
+    residual = prices - trend
+    return trend, residual
+
+
+# ============================================================
+# ENHANCED FEATURE ENGINEERING  (32 features)
 # ============================================================
 FEATURE_COLS = [
-    # Price structure
+    # Price structure (7)
     "ret", "hl", "oc", "body_ratio", "upper_wick", "lower_wick", "is_bullish",
-    # Trend
+    # Trend (4)
     "ema_diff", "price_vs_ema9", "ma_diff", "price_vs_ma10",
-    # Oscillators
-    "rsi_norm", "macd", "macd_hist",
-    # Volatility / bands
-    "bb_pct", "bb_width", "atr",
-    # Volume
+    # Oscillators (5)
+    "rsi_norm", "macd", "macd_hist", "roc5", "momentum3_norm",
+    # Volatility / bands (4)
+    "atr", "bb_pct", "bb_width", "volatility",
+    # Volume (2)
     "vol_ratio", "vol_trend",
-    # Lagged returns & momentum
+    # Lagged returns (3)
     "ret_lag1", "ret_lag2", "ret_lag3",
-    "momentum3_norm", "roc5", "volatility",
-    # Intraday seasonality
+    # Time (2)
     "hour_sin", "hour_cos",
+    # VMD-inspired decomposition (4)
+    "trend_component", "residual_component", "trend_slope", "residual_energy",
 ]
 assert len(FEATURE_COLS) == N_FEATURES, \
-    f"FEATURE_COLS has {len(FEATURE_COLS)} items, expected {N_FEATURES}"
+    f"FEATURE_COLS has {len(FEATURE_COLS)}, expected {N_FEATURES}"
 
 
 def make_features(candles: List[dict]) -> Optional[pd.DataFrame]:
-    """
-    Build 27 engineered features. Returns a DataFrame with FEATURE_COLS columns,
-    NaN rows already dropped. Returns None if too few candles remain.
-    """
     if len(candles) < 30:
         return None
     df = pd.DataFrame(candles)
 
     # ── Price structure ──────────────────────────────────────────
     df["ret"] = df["close"].pct_change()
-    df["hl"]  = (df["high"] - df["low"]) / (df["close"].clip(lower=1e-9))
-    df["oc"]  = (df["close"] - df["open"]) / (df["open"].clip(lower=1e-9))
+    df["hl"]  = (df["high"] - df["low"]) / df["close"].clip(lower=1e-9)
+    df["oc"]  = (df["close"] - df["open"]) / df["open"].clip(lower=1e-9)
 
     body = (df["close"] - df["open"]).abs()
     rng  = (df["high"]  - df["low"]).clip(lower=1e-9)
     df["body_ratio"]  = body / rng
     df["upper_wick"]  = (df["high"] - df[["close","open"]].max(axis=1)) / rng
-    df["lower_wick"]  = (df[["close","open"]].min(axis=1) - df["low"])   / rng
+    df["lower_wick"]  = (df[["close","open"]].min(axis=1) - df["low"])  / rng
     df["is_bullish"]  = (df["close"] > df["open"]).astype(float)
 
-    # ── EMA trend ───────────────────────────────────────────────
+    # ── EMA trend ────────────────────────────────────────────────
     ema9  = df["close"].ewm(span=9,  adjust=False).mean()
     ema21 = df["close"].ewm(span=21, adjust=False).mean()
     df["ema_diff"]      = (ema9 - ema21) / df["close"].clip(lower=1e-9)
@@ -341,14 +389,14 @@ def make_features(candles: List[dict]) -> Optional[pd.DataFrame]:
     df["ma_diff"]       = (ma3 - ma5)  / df["close"].clip(lower=1e-9)
     df["price_vs_ma10"] = (df["close"] - ma10) / ma10.clip(lower=1e-9)
 
-    # ── RSI-14 (normalised to −1 … +1) ──────────────────────────
+    # ── RSI-14 ───────────────────────────────────────────────────
     delta    = df["close"].diff()
     avg_gain = delta.clip(lower=0).ewm(com=13, adjust=False).mean()
     avg_loss = (-delta.clip(upper=0)).ewm(com=13, adjust=False).mean()
     rs       = avg_gain / (avg_loss + 1e-9)
     df["rsi_norm"] = (100 - (100 / (1 + rs)) - 50) / 50
 
-    # ── MACD (12/26/9) ───────────────────────────────────────────
+    # ── MACD ─────────────────────────────────────────────────────
     ema12     = df["close"].ewm(span=12, adjust=False).mean()
     ema26     = df["close"].ewm(span=26, adjust=False).mean()
     macd_line = (ema12 - ema26) / df["close"].clip(lower=1e-9)
@@ -356,7 +404,11 @@ def make_features(candles: List[dict]) -> Optional[pd.DataFrame]:
     df["macd"]      = macd_line
     df["macd_hist"] = macd_line - macd_sig
 
-    # ── Bollinger Bands (10-period) ──────────────────────────────
+    # ── Momentum / ROC ───────────────────────────────────────────
+    df["roc5"]           = df["close"].pct_change(5)
+    df["momentum3_norm"] = df["close"].pct_change(3)
+
+    # ── Bollinger Bands ──────────────────────────────────────────
     bb_mid = df["close"].rolling(10).mean()
     bb_std = df["close"].rolling(10).std().clip(lower=1e-9)
     bb_up  = bb_mid + 2 * bb_std
@@ -364,12 +416,13 @@ def make_features(candles: List[dict]) -> Optional[pd.DataFrame]:
     df["bb_pct"]   = (df["close"] - bb_lo) / (bb_up - bb_lo + 1e-9)
     df["bb_width"] = (bb_up - bb_lo) / bb_mid.clip(lower=1e-9)
 
-    # ── ATR-10 (normalised) ──────────────────────────────────────
+    # ── ATR-10 ───────────────────────────────────────────────────
     hl_r = df["high"] - df["low"]
     hc   = (df["high"] - df["close"].shift()).abs()
     lc   = (df["low"]  - df["close"].shift()).abs()
     tr   = pd.concat([hl_r, hc, lc], axis=1).max(axis=1)
-    df["atr"] = tr.ewm(span=10, adjust=False).mean() / df["close"].clip(lower=1e-9)
+    df["atr"]        = tr.ewm(span=10, adjust=False).mean() / df["close"].clip(lower=1e-9)
+    df["volatility"] = df["ret"].rolling(5).std()
 
     # ── Volume ───────────────────────────────────────────────────
     vm3  = df["volume"].rolling(3).mean()
@@ -377,15 +430,12 @@ def make_features(candles: List[dict]) -> Optional[pd.DataFrame]:
     df["vol_ratio"] = df["volume"] / (vm3  + 1e-9)
     df["vol_trend"] = (vm3 - vm10) / (vm10 + 1e-9)
 
-    # ── Lagged returns & momentum ────────────────────────────────
-    df["ret_lag1"]       = df["ret"].shift(1)
-    df["ret_lag2"]       = df["ret"].shift(2)
-    df["ret_lag3"]       = df["ret"].shift(3)
-    df["momentum3_norm"] = df["close"].pct_change(3)
-    df["roc5"]           = df["close"].pct_change(5)
-    df["volatility"]     = df["ret"].rolling(5).std()
+    # ── Lagged returns ───────────────────────────────────────────
+    df["ret_lag1"] = df["ret"].shift(1)
+    df["ret_lag2"] = df["ret"].shift(2)
+    df["ret_lag3"] = df["ret"].shift(3)
 
-    # ── Intraday time features ───────────────────────────────────
+    # ── Intraday seasonality ─────────────────────────────────────
     try:
         hours = (pd.to_datetime(df["ts"], unit="s")
                    .dt.tz_localize("UTC")
@@ -395,6 +445,21 @@ def make_features(candles: List[dict]) -> Optional[pd.DataFrame]:
         hours = pd.to_datetime(df["ts"], unit="s").dt.hour
     df["hour_sin"] = np.sin(2 * np.pi * hours / 24)
     df["hour_cos"] = np.cos(2 * np.pi * hours / 24)
+
+    # ── VMD-inspired decomposition ───────────────────────────────
+    prices_arr = df["close"].values.astype(np.float64)
+    trend, residual = _vmd_decompose(prices_arr, window=10)
+
+    # Normalise trend as % deviation from current price
+    df["trend_component"]  = (trend - prices_arr) / (prices_arr + 1e-9)
+    df["residual_component"] = residual / (prices_arr + 1e-9)
+
+    # Slope of trend over last 3 candles (finite difference)
+    trend_s = pd.Series(trend)
+    df["trend_slope"] = (trend_s.diff(3) / (prices_arr + 1e-9)).values
+
+    # Energy of residual = rolling variance of residual
+    df["residual_energy"] = (pd.Series(residual).rolling(5).std() / (prices_arr + 1e-9)).values
 
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
     df.dropna(inplace=True)
@@ -406,9 +471,13 @@ def make_features(candles: List[dict]) -> Optional[pd.DataFrame]:
 # ============================================================
 # PYTORCH MODEL DEFINITIONS
 # ============================================================
-class LSTMPredictor(nn.Module):
+class BiLSTMPredictor(nn.Module):
     """
-    Stacked LSTM for sequential BTC candle data.
+    Bidirectional stacked LSTM.
+    Reading the sequence both forward and backward lets the model
+    capture long-range dependencies in both directions — e.g. whether
+    a spike at step t=5 connects to the pattern at t=18.
+
     Input : (B, SEQ_LEN, N_FEATURES)
     Output: (B, 2)  raw logits
     """
@@ -416,33 +485,31 @@ class LSTMPredictor(nn.Module):
                  layers=LSTM_LAYERS, drop=DROPOUT):
         super().__init__()
         self.lstm = nn.LSTM(n_feat, hidden, layers,
-                            batch_first=True, dropout=drop)
+                            batch_first=True, dropout=drop,
+                            bidirectional=True)        # ← bidirectional
+        # Hidden dim doubles because of bidirectionality
         self.head = nn.Sequential(
-            nn.LayerNorm(hidden),
-            nn.Linear(hidden, 32),
+            nn.LayerNorm(hidden * 2),
+            nn.Linear(hidden * 2, 64),
             nn.GELU(),
             nn.Dropout(drop),
-            nn.Linear(32, 2),
+            nn.Linear(64, 2),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out, _ = self.lstm(x)          # (B, T, H)
+        out, _ = self.lstm(x)          # (B, T, 2*H)
         return self.head(out[:, -1, :])
 
 
-class GRUAttentionPredictor(nn.Module):
+class AttentionGRUPredictor(nn.Module):
     """
     TFT-inspired architecture:
       1. Linear input projection → hidden dim
       2. 2-layer GRU encoder
-      3. Multi-head self-attention over all timesteps  ← the TFT insight
-      4. Residual + LayerNorm  (add & norm, like a Transformer block)
+      3. Multi-head self-attention over all timesteps
+      4. Residual + LayerNorm
       5. Feed-forward + residual + LayerNorm
       6. MLP head on the last timestep
-
-    The attention mechanism lets the model focus on the candles that matter
-    most right now (e.g. the spike 3 candles ago), rather than treating all
-    past steps equally like a plain GRU.
 
     Input : (B, SEQ_LEN, N_FEATURES)
     Output: (B, 2)  raw logits
@@ -471,83 +538,170 @@ class GRUAttentionPredictor(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.proj(x)                           # (B, T, H)
-        g, _ = self.gru(x)                         # (B, T, H)
-        a, _ = self.attn(g, g, g)                  # multi-head attention
-        x2   = self.norm1(g + a)                   # residual + norm
-        x3   = self.norm2(x2 + self.ffn(x2))      # FFN residual + norm
-        return self.head(x3[:, -1, :])             # last timestep → logits
+        x  = self.proj(x)
+        g, _ = self.gru(x)
+        a, _ = self.attn(g, g, g)
+        x2   = self.norm1(g + a)
+        x3   = self.norm2(x2 + self.ffn(x2))
+        return self.head(x3[:, -1, :])
 
 
 # ============================================================
-# HYBRID ENSEMBLE
+# ADAPTIVE ENSEMBLE
 # ============================================================
-class HybridEnsemble:
+class AdaptiveEnsemble:
     """
-    Soft-voting ensemble of LSTM, GRU-Attention and XGBoost.
+    Five-model soft-voting ensemble with adaptive weight calculation.
 
-    Design notes
-    ─────────────
-    • scaler is fitted once on the training split and applied consistently
-      to both training and inference data, preventing leakage.
-    • Weights adapt to model availability each training cycle.
-    • predict_proba() is intentionally fast (no grad, eval mode, CPU).
+    Models:  BiLSTM · AttentionGRU · XGBoost · RandomForest · LightGBM
+
+    Adaptive weights
+    ─────────────────
+    Each model tracks its own (predicted, actual) history over the last
+    ADAPTIVE_WINDOW resolved UP/DOWN predictions.
+    weight_i = accuracy_i / sum(accuracy_j for all available j)
+
+    If fewer than ADAPTIVE_WINDOW results exist, BASE_WEIGHTS are used.
+
+    HOLD handling
+    ──────────────
+    Predictions of HOLD are never counted as wins or losses.
+    Accuracy is computed only over UP/DOWN predictions that resolved.
     """
 
     def __init__(self):
-        self.scaler:   Optional[StandardScaler]        = None
-        self.lstm:     Optional[LSTMPredictor]         = None
-        self.gru_attn: Optional[GRUAttentionPredictor] = None
-        self.xgb:      Optional[xgb.XGBClassifier]    = None
-        self.weights:  List[float]                     = list(BASE_WEIGHTS)
+        self.scaler:      Optional[StandardScaler]          = None
+        self.bilstm:      Optional[BiLSTMPredictor]         = None
+        self.attn_gru:    Optional[AttentionGRUPredictor]   = None
+        self.xgb_clf:     Optional[xgb.XGBClassifier]      = None
+        self.rf_clf:      Optional[RandomForestClassifier]  = None
+        self.lgb_clf                                        = None  # LGBMClassifier or None
+        # Per-model rolling result history: list of (pred_class, actual_class)
+        self.result_history: List[List[Tuple[int,int]]] = [[] for _ in range(5)]
+        self.weights: List[float] = list(BASE_WEIGHTS)
 
+    # ------------------------------------------------------------------
+    def _model_available(self) -> List[bool]:
+        return [
+            self.bilstm   is not None,
+            self.attn_gru is not None,
+            self.xgb_clf  is not None,
+            self.rf_clf   is not None,
+            self.lgb_clf  is not None,
+        ]
+
+    # ------------------------------------------------------------------
+    def update_adaptive_weights(self) -> None:
+        """
+        Recalculate per-model weights from rolling accuracy.
+        Falls back to BASE_WEIGHTS if any model has < ADAPTIVE_WINDOW results.
+        """
+        avail = self._model_available()
+        min_history = min(
+            (len(self.result_history[i]) for i, a in enumerate(avail) if a),
+            default=0
+        )
+
+        if min_history < ADAPTIVE_WINDOW:
+            # Not enough data yet — use base weights, renormalised to available
+            total = sum(BASE_WEIGHTS[i] for i, a in enumerate(avail) if a)
+            self.weights = [
+                BASE_WEIGHTS[i] / total if avail[i] else 0.0
+                for i in range(5)
+            ]
+        else:
+            accs = []
+            for i, a in enumerate(avail):
+                if not a:
+                    accs.append(0.0)
+                    continue
+                recent = self.result_history[i][-ADAPTIVE_WINDOW:]
+                accs.append(sum(p == q for p, q in recent) / ADAPTIVE_WINDOW)
+            total = sum(accs) or 1e-9
+            self.weights = [acc / total for acc in accs]
+
+        logger.info(
+            f"Ensemble weights → BiLSTM:{self.weights[0]:.2f} "
+            f"AttnGRU:{self.weights[1]:.2f} XGB:{self.weights[2]:.2f} "
+            f"RF:{self.weights[3]:.2f} LGB:{self.weights[4]:.2f}"
+        )
+
+    # ------------------------------------------------------------------
+    def record_result(self, per_model_preds: List[Optional[int]],
+                      actual_class: int) -> None:
+        """
+        Called after a window resolves.
+        per_model_preds: list of 5 items, each is 0/1 or None if unavailable.
+        actual_class: 0 (DOWN) or 1 (UP).
+        """
+        for i, pred in enumerate(per_model_preds):
+            if pred is not None:
+                self.result_history[i].append((pred, actual_class))
+                # Trim to adaptive window size
+                if len(self.result_history[i]) > ADAPTIVE_WINDOW * 3:
+                    self.result_history[i] = self.result_history[i][-ADAPTIVE_WINDOW:]
+        self.update_adaptive_weights()
+
+    # ------------------------------------------------------------------
     def predict_proba(self, X_seq: np.ndarray,
-                       X_flat: np.ndarray) -> np.ndarray:
+                       X_flat: np.ndarray) -> Tuple[np.ndarray, List[Optional[int]]]:
         """
-        X_seq  : (1, SEQ_LEN, N_FEATURES) for LSTM / GRU-Attn
-        X_flat : (1, N_FEATURES)          for XGBoost
-        Returns: (1, 2)  [P(down), P(up)]
+        Returns
+        ───────
+        proba           : (1, 2)  [P(down), P(up)]
+        per_model_preds : list[5] of argmax class per model (or None)
         """
-        probs, used_w = [], []
+        probs:            List[np.ndarray]    = []
+        used_w:           List[float]         = []
+        per_model_preds:  List[Optional[int]] = [None] * 5
 
-        if self.lstm is not None:
-            p = _torch_infer(self.lstm, X_seq)
+        # BiLSTM
+        if self.bilstm is not None:
+            p = _torch_infer(self.bilstm, X_seq)
             if p is not None:
                 probs.append(p); used_w.append(self.weights[0])
+                per_model_preds[0] = int(np.argmax(p[0]))
 
-        if self.gru_attn is not None:
-            p = _torch_infer(self.gru_attn, X_seq)
+        # AttentionGRU
+        if self.attn_gru is not None:
+            p = _torch_infer(self.attn_gru, X_seq)
             if p is not None:
                 probs.append(p); used_w.append(self.weights[1])
+                per_model_preds[1] = int(np.argmax(p[0]))
 
-        if self.xgb is not None:
+        # XGBoost
+        if self.xgb_clf is not None:
             try:
-                p = self.xgb.predict_proba(X_flat)
+                p = self.xgb_clf.predict_proba(X_flat)
                 probs.append(p); used_w.append(self.weights[2])
+                per_model_preds[2] = int(np.argmax(p[0]))
             except Exception as e:
                 logger.error(f"XGB infer: {e}")
 
+        # RandomForest
+        if self.rf_clf is not None:
+            try:
+                p = self.rf_clf.predict_proba(X_flat)
+                probs.append(p); used_w.append(self.weights[3])
+                per_model_preds[3] = int(np.argmax(p[0]))
+            except Exception as e:
+                logger.error(f"RF infer: {e}")
+
+        # LightGBM
+        if self.lgb_clf is not None:
+            try:
+                p = self.lgb_clf.predict_proba(X_flat)
+                probs.append(p); used_w.append(self.weights[4])
+                per_model_preds[4] = int(np.argmax(p[0]))
+            except Exception as e:
+                logger.error(f"LGB infer: {e}")
+
         if not probs:
-            return np.array([[0.5, 0.5]])
+            return np.array([[0.5, 0.5]]), per_model_preds
 
-        total = sum(used_w)
-        return sum(p * w for p, w in zip(probs, used_w)) / total
-
-    def update_weights(self) -> None:
-        """Redistribute BASE_WEIGHTS among available sub-models."""
-        avail = [self.lstm is not None,
-                 self.gru_attn is not None,
-                 self.xgb is not None]
-        if all(avail):
-            self.weights = list(BASE_WEIGHTS)
-        else:
-            total = sum(BASE_WEIGHTS[i] for i, a in enumerate(avail) if a)
-            self.weights = [BASE_WEIGHTS[i] / total if avail[i] else 0.0
-                            for i in range(3)]
-        logger.info(
-            f"Ensemble weights → LSTM:{self.weights[0]:.2f} "
-            f"GRU-Attn:{self.weights[1]:.2f} XGB:{self.weights[2]:.2f}"
-        )
+        total = sum(used_w) or 1e-9
+        combined = sum(p * w for p, w in zip(probs, used_w)) / total
+        return combined, per_model_preds
 
 
 def _torch_infer(model: nn.Module, X_seq: np.ndarray) -> Optional[np.ndarray]:
@@ -565,21 +719,14 @@ def _torch_infer(model: nn.Module, X_seq: np.ndarray) -> Optional[np.ndarray]:
 # PYTORCH TRAINING HELPER
 # ============================================================
 def _train_torch(model: nn.Module, X: np.ndarray, y: np.ndarray) -> nn.Module:
-    """
-    Trains a PyTorch model with:
-      • Chronological 80/20 train–val split (no look-ahead leakage)
-      • AdamW + ReduceLROnPlateau
-      • Gradient clipping (max_norm=1.0)
-      • Early stopping on validation loss
-    """
     X_t = torch.FloatTensor(X)
     y_t = torch.LongTensor(y)
 
-    split      = max(int(len(X_t) * 0.8), 1)
-    train_dl   = DataLoader(TensorDataset(X_t[:split], y_t[:split]),
-                             batch_size=TRAIN_BATCH, shuffle=True, drop_last=False)
-    val_dl     = DataLoader(TensorDataset(X_t[split:], y_t[split:]),
-                             batch_size=TRAIN_BATCH, drop_last=False)
+    split    = max(int(len(X_t) * 0.8), 1)
+    train_dl = DataLoader(TensorDataset(X_t[:split], y_t[:split]),
+                           batch_size=TRAIN_BATCH, shuffle=True, drop_last=False)
+    val_dl   = DataLoader(TensorDataset(X_t[split:], y_t[split:]),
+                           batch_size=TRAIN_BATCH, drop_last=False)
 
     opt       = torch.optim.AdamW(model.parameters(), lr=TRAIN_LR, weight_decay=1e-4)
     sched     = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -627,12 +774,6 @@ def _train_torch(model: nn.Module, X: np.ndarray, y: np.ndarray) -> nn.Module:
 
 def _build_sequences(feat: np.ndarray, labels: np.ndarray,
                       seq_len: int) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Sliding-window sequences.
-    feat  : (N, F)  scaled features
-    labels: (N,)
-    Returns X_seq (M, seq_len, F) and y (M,),  M = N − seq_len + 1
-    """
     X, y = [], []
     for i in range(seq_len - 1, min(len(feat), len(labels))):
         X.append(feat[i - seq_len + 1: i + 1])
@@ -653,7 +794,6 @@ def train_model_from_candles(candles: List[dict]) -> None:
         return
 
     try:
-        # Features for all candles except the last (no label yet)
         feat_df = make_features(candles[:-1])
         if feat_df is None or len(feat_df) == 0:
             return
@@ -661,7 +801,6 @@ def train_model_from_candles(candles: List[dict]) -> None:
         nf     = len(feat_df)
         offset = (n - 1) - nf
 
-        # Build next-candle direction labels
         labels = []
         for i in range(nf):
             idx = offset + i + 1
@@ -678,60 +817,91 @@ def train_model_from_candles(candles: List[dict]) -> None:
         raw     = feat_df.values.astype(np.float32)
         y_arr   = np.array(labels, dtype=np.int64)
 
-        # Fit scaler on training portion only (80 % chronological split)
         split  = max(int(len(raw) * 0.8), 1)
         scaler = StandardScaler()
         scaler.fit(raw[:split])
         scaled = scaler.transform(raw)
 
-        # Recency weighting for XGBoost
-        # Most-recent sample → weight 1.0; oldest → ~0.05
+        # Recency sample weights for tree models
         ns = len(y_arr)
         sw = np.array([0.95 ** (ns - 1 - i) for i in range(ns)], dtype=np.float32)
 
-        ens = HybridEnsemble()
-        ens.scaler = scaler
+        # Preserve adaptive weight history if a model already exists
+        with model_lock:
+            old_ens = model
 
-        # ── XGBoost ──────────────────────────────────────────────────
+        ens = AdaptiveEnsemble()
+        ens.scaler = scaler
+        if old_ens is not None and isinstance(old_ens, AdaptiveEnsemble):
+            ens.result_history = old_ens.result_history   # carry over history
+            ens.weights        = old_ens.weights
+
+        # ── XGBoost ──────────────────────────────────────────────
         logger.info("  Training XGBoost …")
         xgb_model = xgb.XGBClassifier(
-            n_estimators=150, max_depth=4, learning_rate=0.05,
+            n_estimators=200, max_depth=5, learning_rate=0.05,
             subsample=0.8, colsample_bytree=0.8,
             min_child_weight=3, reg_alpha=0.1, reg_lambda=1.0,
             eval_metric="logloss", verbosity=0,
         )
         xgb_model.fit(scaled, y_arr, sample_weight=sw)
-        ens.xgb = xgb_model
+        ens.xgb_clf = xgb_model
         logger.info("  XGBoost ✓")
 
-        # ── LSTM + GRU-Attention ─────────────────────────────────────
+        # ── RandomForest ─────────────────────────────────────────
+        logger.info("  Training RandomForest …")
+        rf_model = RandomForestClassifier(
+            n_estimators=200, max_depth=8,
+            min_samples_leaf=3, max_features="sqrt",
+            n_jobs=-1, random_state=42,
+        )
+        rf_model.fit(scaled, y_arr, sample_weight=sw)
+        ens.rf_clf = rf_model
+        logger.info("  RandomForest ✓")
+
+        # ── LightGBM ─────────────────────────────────────────────
+        if HAS_LGB:
+            logger.info("  Training LightGBM …")
+            lgb_model = lgb.LGBMClassifier(
+                n_estimators=300, max_depth=6, learning_rate=0.05,
+                subsample=0.8, colsample_bytree=0.8,
+                min_child_samples=5, reg_alpha=0.1, reg_lambda=1.0,
+                verbosity=-1, n_jobs=2,
+            )
+            lgb_model.fit(scaled, y_arr, sample_weight=sw)
+            ens.lgb_clf = lgb_model
+            logger.info("  LightGBM ✓")
+        else:
+            logger.info("  LightGBM skipped (not installed)")
+
+        # ── Deep models (BiLSTM + AttentionGRU) ─────────────────
         if n >= MIN_CANDLES_DEEP:
             X_seq, y_seq = _build_sequences(scaled, y_arr, SEQ_LEN)
             logger.info(f"  Sequence dataset: {len(X_seq)} × {SEQ_LEN} × {N_FEATURES}")
 
             if len(X_seq) >= 20:
-                logger.info("  Training LSTM …")
-                lstm = LSTMPredictor(N_FEATURES, LSTM_HIDDEN, LSTM_LAYERS, DROPOUT)
-                ens.lstm = _train_torch(lstm, X_seq, y_seq)
-                logger.info("  LSTM ✓")
+                logger.info("  Training BiLSTM …")
+                bilstm = BiLSTMPredictor(N_FEATURES, LSTM_HIDDEN, LSTM_LAYERS, DROPOUT)
+                ens.bilstm = _train_torch(bilstm, X_seq, y_seq)
+                logger.info("  BiLSTM ✓")
 
-                logger.info("  Training GRU-Attention (TFT-inspired) …")
-                gru = GRUAttentionPredictor(N_FEATURES, GRU_HIDDEN,
-                                             GRU_LAYERS, ATTN_HEADS, DROPOUT)
-                ens.gru_attn = _train_torch(gru, X_seq, y_seq)
-                logger.info("  GRU-Attention ✓")
+                logger.info("  Training AttentionGRU (TFT-inspired) …")
+                attn_gru = AttentionGRUPredictor(
+                    N_FEATURES, GRU_HIDDEN, GRU_LAYERS, ATTN_HEADS, DROPOUT)
+                ens.attn_gru = _train_torch(attn_gru, X_seq, y_seq)
+                logger.info("  AttentionGRU ✓")
             else:
-                logger.warning(f"  Not enough sequences ({len(X_seq)}) for deep learning")
+                logger.warning(f"  Not enough sequences ({len(X_seq)}) for deep models")
         else:
-            logger.info(f"  {n} candles < {MIN_CANDLES_DEEP} — XGBoost-only this cycle")
+            logger.info(f"  {n} candles < {MIN_CANDLES_DEEP} — tree-only this cycle")
 
-        ens.update_weights()
+        ens.update_adaptive_weights()
 
         with model_lock:
             model = ens
 
         save_model(ens, wins, losses)
-        logger.info("  Ensemble saved to DB ✓")
+        logger.info("  Adaptive ensemble saved to DB ✓")
 
     except Exception as exc:
         logger.exception(f"Training error: {exc}")
@@ -740,7 +910,14 @@ def train_model_from_candles(candles: List[dict]) -> None:
 # ============================================================
 # PREDICTION
 # ============================================================
+# Store per-model predictions for the most recent window so we can
+# update the ensemble's result history when the window resolves.
+_last_per_model_preds: List[Optional[int]] = [None] * 5
+_last_per_model_lock  = threading.Lock()
+
+
 def predict_from_candles(candles: List[dict]) -> dict:
+    global _last_per_model_preds
     default = {"signal": "HOLD", "confidence": 0, "next_window": ""}
 
     with model_lock:
@@ -756,17 +933,16 @@ def predict_from_candles(candles: List[dict]) -> dict:
 
         scaled = ens.scaler.transform(feat_df.values.astype(np.float32))
 
-        # Build sequence for LSTM / GRU-Attn
         if len(scaled) >= SEQ_LEN:
             seq = scaled[-SEQ_LEN:]
         else:
             pad = np.zeros((SEQ_LEN - len(scaled), N_FEATURES), dtype=np.float32)
             seq = np.vstack([pad, scaled])
 
-        X_seq  = seq[np.newaxis, :, :]   # (1, SEQ_LEN, F)
-        X_flat = scaled[[-1], :]         # (1, F)
+        X_seq  = seq[np.newaxis, :, :]
+        X_flat = scaled[[-1], :]
 
-        prob = ens.predict_proba(X_seq, X_flat)   # (1, 2)
+        prob, per_model = ens.predict_proba(X_seq, X_flat)
         up_p = float(prob[0, 1])
         conf = int(round(max(up_p, 1 - up_p) * 100))
 
@@ -774,13 +950,22 @@ def predict_from_candles(candles: List[dict]) -> dict:
         elif up_p <= SIGNAL_DOWN_THRESH: signal = "DOWN"
         else:                            signal = "HOLD"
 
+        # Store per-model predictions for later result tracking
+        with _last_per_model_lock:
+            _last_per_model_preds = per_model
+
         now       = datetime.now(TZ)
         nm        = ((now.minute // 5) + 1) * 5
         ns        = now.replace(minute=0, second=0, microsecond=0) + timedelta(minutes=nm)
         ne        = ns + timedelta(minutes=5)
         nxt_range = f"{ns.strftime('%H:%M')}-{ne.strftime('%H:%M')}"
 
-        return {"signal": signal, "confidence": conf, "next_window": nxt_range}
+        # HOLD: confidence shown as 0 so UI renders "--"
+        if signal == "HOLD":
+            conf = 0
+
+        return {"signal": signal, "confidence": conf, "next_window": nxt_range,
+                "per_model": per_model}
 
     except Exception as exc:
         logger.error(f"Prediction error: {exc}")
@@ -788,50 +973,41 @@ def predict_from_candles(candles: List[dict]) -> dict:
 
 
 # ============================================================
-# CANDLE BUILDING (FIXED - Proper window detection)
+# CANDLE BUILDING
 # ============================================================
 def process_price_tick(price: float, trade_ts: float) -> None:
     global live_candle, live_window_start, candles_since_retrain, wins, losses
 
     with state_lock:
-        # Calculate which 5-minute window this timestamp belongs to
         current_window_start = int(trade_ts // WINDOW_SECONDS) * WINDOW_SECONDS
-        
-        # Case 1: No live candle exists yet - initialize
+
         if live_window_start is None:
             live_window_start = current_window_start
             live_candle = _new_candle(live_window_start, price)
             return
-        
-        # Case 2: Current tick belongs to a NEWER window than our live candle
+
         if current_window_start > live_window_start:
-            # Close the old window first
             if live_candle is not None:
                 _close_current_window_locked()
-            # Start new window
             live_window_start = current_window_start
             live_candle = _new_candle(live_window_start, price)
             return
-        
-        # Case 3: Current tick belongs to the SAME window as our live candle
+
         if live_candle is not None:
-            # Check if the window should have expired by time
             window_end_time = live_candle["ts"] + WINDOW_SECONDS
             if trade_ts >= window_end_time:
-                # Window has expired - close it and start new
                 _close_current_window_locked()
                 live_window_start = current_window_start
                 live_candle = _new_candle(live_window_start, price)
             else:
-                # Update current candle prices
-                live_candle["high"] = max(live_candle["high"], price)
-                live_candle["low"] = min(live_candle["low"], price)
+                live_candle["high"]  = max(live_candle["high"], price)
+                live_candle["low"]   = min(live_candle["low"],  price)
                 live_candle["close"] = price
 
 
 def _new_candle(ts: float, price: float) -> dict:
-    return {"ts": ts, "open": price, "high": price, "low": price,
-            "close": price, "volume": 0.0}
+    return {"ts": ts, "open": price, "high": price,
+            "low": price, "close": price, "volume": 0.0}
 
 
 def _close_current_window_locked() -> None:
@@ -851,16 +1027,38 @@ def _close_current_window_locked() -> None:
             row.update(actual=actual, act_open=candle["open"],
                        act_close=candle["close"], window_end=we_str,
                        window=f"{ws_str}-{we_str}")
-            if row["predicted"] == actual:
-                row["result"] = "✅"; wins   += 1
-            else:
-                row["result"] = "❌"; losses += 1
 
-            update_prediction_result(ws_str, we_str, actual,
-                                     candle["open"], candle["close"], row["result"])
-            save_stats(wins, losses)
-            logger.info(f"Window {ws_str}-{we_str}: "
-                        f"Pred={row['predicted']} Act={actual} {row['result']}")
+            predicted = row["predicted"]
+
+            if predicted == "HOLD":
+                # HOLD is never evaluated — mark as skipped, not a win/loss
+                row["result"] = "—"
+                update_prediction_result(ws_str, we_str, actual,
+                                         candle["open"], candle["close"], "—")
+                logger.info(f"Window {ws_str}-{we_str}: Pred=HOLD (not evaluated)")
+            else:
+                if predicted == actual:
+                    row["result"] = "✅"
+                    wins += 1
+                else:
+                    row["result"] = "❌"
+                    losses += 1
+
+                update_prediction_result(ws_str, we_str, actual,
+                                         candle["open"], candle["close"], row["result"])
+                save_stats(wins, losses)
+
+                # Update adaptive ensemble weights with per-model predictions
+                actual_class = 1 if actual == "UP" else 0
+                with _last_per_model_lock:
+                    pmp = list(_last_per_model_preds)
+                with model_lock:
+                    ens = model
+                if ens is not None and isinstance(ens, AdaptiveEnsemble):
+                    ens.record_result(pmp, actual_class)
+
+                logger.info(f"Window {ws_str}-{we_str}: "
+                            f"Pred={predicted} Act={actual} {row['result']}")
             break
 
     snap = list(completed_candles)
@@ -889,7 +1087,7 @@ def _close_current_window_locked() -> None:
 
 
 # ============================================================
-# COINBASE WEBSOCKET  (unchanged from original)
+# COINBASE WEBSOCKET
 # ============================================================
 def _coinbase_thread() -> None:
     url, retry = "wss://ws-feed.exchange.coinbase.com", 2
@@ -926,7 +1124,7 @@ def _coinbase_thread() -> None:
 
 
 # ============================================================
-# PRICE PROCESSOR  (unchanged from original)
+# PRICE PROCESSOR
 # ============================================================
 def price_processor_thread() -> None:
     while True:
@@ -940,12 +1138,13 @@ def price_processor_thread() -> None:
 
 
 # ============================================================
-# BROADCAST  (unchanged from original)
+# BROADCAST
 # ============================================================
 async def _periodic_broadcast() -> None:
     while True:
         await asyncio.sleep(1)
         await _broadcast_state()
+
 
 async def _broadcast_state() -> None:
     msg  = json.dumps(_build_state_payload())
@@ -962,6 +1161,7 @@ async def _broadcast_state() -> None:
             for ws in dead:
                 if ws in _clients:
                     _clients.remove(ws)
+
 
 def _build_state_payload() -> dict:
     with state_lock:
@@ -980,7 +1180,8 @@ def _build_state_payload() -> dict:
 
     return {
         "price": round(live_price, 2),
-        "signal": pred["signal"], "confidence": pred["confidence"],
+        "signal": pred["signal"],
+        "confidence": pred["confidence"],
         "next_window": pred["next_window"],
         "wins": w, "losses": l,
         "ohlc": ohlc, "table": rows,
@@ -989,7 +1190,7 @@ def _build_state_payload() -> dict:
 
 
 # ============================================================
-# HTML FRONTEND  (unchanged from original)
+# HTML FRONTEND
 # ============================================================
 HTML_CONTENT = """<!DOCTYPE html>
 <html lang="en">
@@ -998,447 +1199,98 @@ HTML_CONTENT = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=yes">
 <title>BTC 5-Min Predictor</title>
 <style>
-  * {
-    box-sizing: border-box;
-    margin: 0;
-    padding: 0;
-  }
-  
+  * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
-    background: #080C14;
-    color: #C8D8EF;
+    background: #080C14; color: #C8D8EF;
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Helvetica Neue', sans-serif;
     min-height: 100vh;
-    padding: 0;
-    margin: 0;
   }
-  
-  .container {
-    max-width: 1280px;
-    margin: 0 auto;
-    padding: 12px;
-  }
-  
-  .header {
-    margin-bottom: 12px;
-    padding: 8px 0;
-    text-align: center;
-  }
-  
-  .header h1 {
-    font-size: 1.4rem;
-    font-weight: 700;
-    color: #F7931A;
-    letter-spacing: .02em;
-    padding: 4px 0;
-  }
-  
+  .container { max-width: 1280px; margin: 0 auto; padding: 12px; }
+  .header { margin-bottom: 12px; padding: 8px 0; text-align: center; }
+  .header h1 { font-size: 1.4rem; font-weight: 700; color: #F7931A; letter-spacing: .02em; }
   .status-bar {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    margin-bottom: 12px;
-    font-size: 0.8rem;
-    color: #4A6080;
-    flex-wrap: wrap;
+    display: flex; align-items: center; gap: 10px;
+    margin-bottom: 12px; font-size: 0.8rem; color: #4A6080; flex-wrap: wrap;
   }
-  
-  .status-bar #clock-gmt3 {
-    color: #FFFFFF;
-    margin-left: auto;
-  }
-  
-  .dot {
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    display: inline-block;
-    flex-shrink: 0;
-  }
-  
-  .dot-ok {
-    background: #00E5A0;
-    box-shadow: 0 0 6px #00E5A0;
-  }
-  
-  .dot-bad {
-    background: #FF4560;
-  }
-  
-  .dot-wait {
-    background: #F7931A;
-    animation: pulse 1.2s infinite;
-  }
-  
-  @keyframes pulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.4; }
-  }
-  
+  .status-bar #clock-gmt3 { color: #FFFFFF; margin-left: auto; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
+  .dot-ok  { background: #00E5A0; box-shadow: 0 0 6px #00E5A0; }
+  .dot-bad { background: #FF4560; }
+  .dot-wait { background: #F7931A; animation: pulse 1.2s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+
   .main-grid {
-    display: grid;
-    grid-template-columns: 1fr 340px;
-    gap: 12px;
-    margin-bottom: 12px;
-    align-items: stretch;
+    display: grid; grid-template-columns: 1fr 340px;
+    gap: 12px; margin-bottom: 12px; align-items: stretch;
   }
-  
   #tv-chart {
-    background: #0D1421;
-    border-radius: 10px;
-    border: 1px solid #1E2D45;
-    height: 380px;
-    overflow: hidden;
+    background: #0D1421; border-radius: 10px;
+    border: 1px solid #1E2D45; height: 380px; overflow: hidden;
   }
-  
-  .sidebar {
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
-  }
-  
-  .sidebar .card:first-child {
-    flex: 0 0 auto;
-  }
-  
-  .sidebar .card:nth-child(2) {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    justify-content: center;
-  }
-  
-  .sidebar .card:nth-child(3) {
-    flex: 0 0 auto;
-  }
-  
+  .sidebar { display: flex; flex-direction: column; gap: 12px; }
   .card {
-    background: #0D1421;
-    border: 1px solid #1E2D45;
-    border-radius: 10px;
-    padding: 14px;
+    background: #0D1421; border: 1px solid #1E2D45;
+    border-radius: 10px; padding: 14px;
   }
-  
   .card-title {
-    font-size: 0.85rem;
-    color: #4A6080;
-    text-transform: uppercase;
-    letter-spacing: 0.1em;
-    margin-bottom: 8px;
+    font-size: 0.85rem; color: #4A6080;
+    text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 8px;
   }
-  
-  .price {
-    font-size: 2rem;
-    font-weight: 700;
-    color: #F7931A;
-  }
-  
-  .pchange {
-    font-size: 0.82rem;
-    margin-left: 6px;
-  }
-  
-  .pred-row {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    margin-top: 4px;
-  }
-  
-  .pred-arrow {
-    font-size: 2.4rem;
-    line-height: 1;
-  }
-  
-  .pred-dir {
-    font-size: 1.3rem;
-    font-weight: 700;
-  }
-  
-  .conf-bar {
-    background: #1E2D45;
-    border-radius: 4px;
-    height: 6px;
-    margin-top: 8px;
-    overflow: hidden;
-  }
-  
-  .conf-fill {
-    height: 100%;
-    width: 0%;
-    transition: width 0.4s ease;
-  }
-  
-  .countdown {
-    display: flex;
-    align-items: center;
-    gap: 14px;
-  }
-  
-  .cd-ring {
-    width: 58px;
-    height: 58px;
-    transform: rotate(-90deg);
-  }
-  
-  .cd-text {
-    font-size: 1.8rem;
-    font-weight: 700;
-    color: #F7931A;
-  }
-  
-  .bottom-row {
-    display: grid;
-    gap: 12px;
-    grid-template-columns: 1fr 1fr;
-    margin-bottom: 12px;
-  }
-  
-  .ohlc-grid {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 8px;
-    margin-top: 6px;
-  }
-  
-  .ohlc-cell {
-    background: #0F1623;
-    border-radius: 6px;
-    padding: 7px 10px;
-    border: 1px solid #1E2D45;
-  }
-  
-  .ohlc-cell .lbl {
-    font-size: 0.6rem;
-    color: #4A6080;
-  }
-  
-  .ohlc-cell .val {
-    font-size: 0.88rem;
-    font-weight: 700;
-    margin-top: 2px;
-  }
-  
-  .perf-row {
-    display: flex;
-    gap: 10px;
-    margin-top: 8px;
-  }
-  
-  .perf-stat {
-    flex: 1;
-    text-align: center;
-    background: #0F1623;
-    border-radius: 7px;
-    padding: 8px;
-    border: 1px solid #1E2D45;
-  }
-  
-  .perf-num {
-    font-size: 1.35rem;
-    font-weight: 700;
-  }
-  
-  .perf-lbl {
-    font-size: 0.6rem;
-    color: #4A6080;
-    margin-top: 2px;
-  }
-  
-  .table-wrapper {
-    overflow-x: auto;
-    margin-top: 10px;
-  }
-  
-  table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 0.75rem;
-  }
-  
-  th, td {
-    padding: 8px;
-    text-align: left;
-    border-bottom: 1px solid #1E2D45;
-  }
-  
-  th {
-    color: #4A6080;
-    font-weight: 600;
-  }
-  
-  .up {
-    color: #00E5A0;
-  }
-  
-  .down {
-    color: #FF4560;
-  }
-  
+  .price { font-size: 2rem; font-weight: 700; color: #F7931A; }
+  .pchange { font-size: 0.82rem; margin-left: 6px; }
+  .pred-row { display: flex; align-items: center; gap: 12px; margin-top: 4px; }
+  .pred-arrow { font-size: 2.4rem; line-height: 1; }
+  .pred-dir { font-size: 1.3rem; font-weight: 700; }
+  .conf-bar { background: #1E2D45; border-radius: 4px; height: 6px; margin-top: 8px; overflow: hidden; }
+  .conf-fill { height: 100%; width: 0%; transition: width 0.4s ease; }
+  .countdown { display: flex; align-items: center; gap: 14px; }
+  .cd-ring { width: 58px; height: 58px; transform: rotate(-90deg); }
+  .cd-text { font-size: 1.8rem; font-weight: 700; color: #F7931A; }
+  .bottom-row { display: grid; gap: 12px; grid-template-columns: 1fr 1fr; margin-bottom: 12px; }
+  .ohlc-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 6px; }
+  .ohlc-cell { background: #0F1623; border-radius: 6px; padding: 7px 10px; border: 1px solid #1E2D45; }
+  .ohlc-cell .lbl { font-size: 0.6rem; color: #4A6080; }
+  .ohlc-cell .val { font-size: 0.88rem; font-weight: 700; margin-top: 2px; }
+  .perf-row { display: flex; gap: 10px; margin-top: 8px; }
+  .perf-stat { flex:1; text-align:center; background:#0F1623; border-radius:7px; padding:8px; border:1px solid #1E2D45; }
+  .perf-num { font-size: 1.35rem; font-weight: 700; }
+  .perf-lbl { font-size: 0.6rem; color: #4A6080; margin-top: 2px; }
+  .table-wrapper { overflow-x: auto; margin-top: 10px; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.75rem; }
+  th, td { padding: 8px; text-align: left; border-bottom: 1px solid #1E2D45; }
+  th { color: #4A6080; font-weight: 600; }
+  .up   { color: #00E5A0; }
+  .down { color: #FF4560; }
+  .hold-clr { color: #4A6080; }
   .disclaimer {
-    background: #0F1623;
-    border-radius: 8px;
-    padding: 10px;
-    font-size: 0.7rem;
-    text-align: center;
-    color: #FACC15;
-    border: 1px solid rgba(250, 204, 21, 0.13);
-    margin-top: 12px;
+    background: #0F1623; border-radius: 8px; padding: 10px;
+    font-size: 0.7rem; text-align: center; color: #FACC15;
+    border: 1px solid rgba(250,204,21,.13); margin-top: 12px;
   }
-  
-  .flash-up {
-    animation: flashUp 0.4s ease;
+  .flash-up { animation: flashUp 0.4s ease; }
+  .flash-dn { animation: flashDn 0.4s ease; }
+  @keyframes flashUp { 0%,100%{color:#C8D8EF} 50%{color:#00E5A0} }
+  @keyframes flashDn { 0%,100%{color:#C8D8EF} 50%{color:#FF4560} }
+
+  @media (max-width:900px) {
+    .main-grid { grid-template-columns: 1fr; }
+    #tv-chart { height: 320px; }
+    .sidebar { display: grid; grid-template-columns: repeat(3,1fr); gap: 12px; }
+    .bottom-row { grid-template-columns: 1fr; }
   }
-  
-  .flash-dn {
-    animation: flashDn 0.4s ease;
-  }
-  
-  @keyframes flashUp {
-    0%, 100% { color: #C8D8EF; }
-    50% { color: #00E5A0; }
-  }
-  
-  @keyframes flashDn {
-    0%, 100% { color: #C8D8EF; }
-    50% { color: #FF4560; }
-  }
-  
-  @media (max-width: 900px) {
-    .main-grid {
-      grid-template-columns: 1fr;
-    }
-    
-    #tv-chart {
-      height: 320px;
-    }
-    
-    .sidebar {
-      display: grid;
-      grid-template-columns: repeat(3, 1fr);
-      gap: 12px;
-    }
-    
-    .sidebar .card:first-child,
-    .sidebar .card:nth-child(2),
-    .sidebar .card:nth-child(3) {
-      flex: auto;
-    }
-    
-    .bottom-row {
-      grid-template-columns: 1fr;
-    }
-    
-    .header h1 {
-      font-size: 1.2rem;
-    }
-  }
-  
-  @media (max-width: 600px) {
-    .container {
-      padding: 8px;
-    }
-    
-    .header h1 {
-      font-size: 1.1rem;
-    }
-    
-    .status-bar {
-      font-size: 0.7rem;
-      gap: 6px;
-    }
-    
-    .sidebar {
-      grid-template-columns: 1fr;
-      gap: 10px;
-    }
-    
-    #tv-chart {
-      height: 260px;
-    }
-    
-    .card {
-      padding: 10px;
-    }
-    
-    .card-title {
-      font-size: 0.75rem;
-    }
-    
-    .price {
-      font-size: 1.5rem;
-    }
-    
-    .pred-arrow {
-      font-size: 1.8rem;
-    }
-    
-    .pred-dir {
-      font-size: 1.1rem;
-    }
-    
-    .cd-text {
-      font-size: 1.4rem;
-    }
-    
-    .cd-ring {
-      width: 48px;
-      height: 48px;
-    }
-    
-    .perf-num {
-      font-size: 1.1rem;
-    }
-    
-    table {
-      font-size: 0.65rem;
-    }
-    
-    th, td {
-      padding: 6px 4px;
-    }
-    
-    .ohlc-cell {
-      padding: 5px 8px;
-    }
-    
-    .ohlc-cell .val {
-      font-size: 0.75rem;
-    }
-    
-    .bottom-row {
-      gap: 10px;
-    }
-  }
-  
-  @media (max-width: 380px) {
-    .container {
-      padding: 6px;
-    }
-    
-    .header h1 {
-      font-size: 1rem;
-    }
-    
-    .status-bar {
-      font-size: 0.65rem;
-    }
-    
-    .pred-row {
-      gap: 8px;
-    }
-    
-    .countdown {
-      gap: 10px;
-    }
-    
-    table {
-      font-size: 0.6rem;
-    }
-    
-    th, td {
-      padding: 4px 3px;
-    }
+  @media (max-width:600px) {
+    .container { padding: 8px; }
+    .header h1 { font-size: 1.1rem; }
+    .status-bar { font-size: 0.7rem; gap: 6px; }
+    .sidebar { grid-template-columns: 1fr; gap: 10px; }
+    #tv-chart { height: 260px; }
+    .card { padding: 10px; }
+    .price { font-size: 1.5rem; }
+    .pred-arrow { font-size: 1.8rem; }
+    .cd-text { font-size: 1.4rem; }
+    .cd-ring { width: 48px; height: 48px; }
+    table { font-size: 0.65rem; }
+    th, td { padding: 6px 4px; }
   }
 </style>
 </head>
@@ -1458,14 +1310,17 @@ HTML_CONTENT = """<!DOCTYPE html>
     <div class="sidebar">
       <div class="card">
         <div class="card-title">Live BTC / USD</div>
-        <div><span class="price" id="price-val">$---.--</span><span class="pchange" id="price-change">--</span></div>
+        <div>
+          <span class="price" id="price-val">$---.--</span>
+          <span class="pchange" id="price-change">--</span>
+        </div>
       </div>
       <div class="card">
         <div class="card-title">Next 5-Min Prediction</div>
         <div class="pred-row">
           <span class="pred-arrow" id="pred-arrow" style="color:#4A6080">◆</span>
-          <span class="pred-dir" id="pred-dir" style="color:#4A6080">HOLD</span>
-          <span id="conf-pct" style="font-size:.85rem;color:#4A6080">--%</span>
+          <span class="pred-dir"   id="pred-dir"   style="color:#4A6080">HOLD</span>
+          <span id="conf-pct" style="font-size:.85rem;color:#4A6080">--</span>
         </div>
         <div class="conf-bar"><div class="conf-fill" id="conf-bar"></div></div>
         <div id="pred-window" style="margin-top:6px;font-size:.7rem;color:#4A6080;"></div>
@@ -1488,18 +1343,18 @@ HTML_CONTENT = """<!DOCTYPE html>
     <div class="card">
       <div class="card-title">Current Window</div>
       <div class="ohlc-grid">
-        <div class="ohlc-cell"><div class="lbl">Open</div><div class="val" id="o-open">--</div></div>
-        <div class="ohlc-cell"><div class="lbl">High</div><div class="val up" id="o-high">--</div></div>
-        <div class="ohlc-cell"><div class="lbl">Low</div><div class="val down" id="o-low">--</div></div>
-        <div class="ohlc-cell"><div class="lbl">Close</div><div class="val" id="o-close">--</div></div>
+        <div class="ohlc-cell"><div class="lbl">Open</div><div class="val"        id="o-open">--</div></div>
+        <div class="ohlc-cell"><div class="lbl">High</div><div class="val up"     id="o-high">--</div></div>
+        <div class="ohlc-cell"><div class="lbl">Low</div> <div class="val down"   id="o-low">--</div></div>
+        <div class="ohlc-cell"><div class="lbl">Close</div><div class="val"       id="o-close">--</div></div>
       </div>
     </div>
     <div class="card">
-      <div class="card-title">Performance</div>
+      <div class="card-title">Performance  <span style="font-size:.65rem;color:#4A6080">(UP/DOWN only)</span></div>
       <div class="perf-row">
-        <div class="perf-stat"><div class="perf-num up" id="p-wins">0</div><div class="perf-lbl">Wins</div></div>
+        <div class="perf-stat"><div class="perf-num up"   id="p-wins">0</div><div class="perf-lbl">Wins</div></div>
         <div class="perf-stat"><div class="perf-num down" id="p-losses">0</div><div class="perf-lbl">Losses</div></div>
-        <div class="perf-stat"><div class="perf-num" id="p-acc" style="color:#F7931A">--%</div><div class="perf-lbl">Accuracy</div></div>
+        <div class="perf-stat"><div class="perf-num" id="p-acc" style="color:#F7931A">--</div><div class="perf-lbl">Accuracy</div></div>
       </div>
     </div>
   </div>
@@ -1510,7 +1365,8 @@ HTML_CONTENT = """<!DOCTYPE html>
       <table>
         <thead>
           <tr>
-            <th>Window</th><th>Prediction</th><th>Conf</th><th>Act.Open</th><th>Act.Close</th><th>Actual</th><th>Result</th>
+            <th>Window</th><th>Prediction</th><th>Conf</th>
+            <th>Act.Open</th><th>Act.Close</th><th>Actual</th><th>Result</th>
           </tr>
         </thead>
         <tbody id="history-body">
@@ -1526,9 +1382,9 @@ HTML_CONTENT = """<!DOCTYPE html>
 <script src="https://s3.tradingview.com/tv.js"></script>
 <script>
   new TradingView.widget({
-    container_id:'tv-widget',symbol:'BITSTAMP:BTCUSD',interval:'5',
-    theme:'dark',style:'1',locale:'en',toolbar_bg:'#080C14',
-    enable_publishing:false,autosize:true
+    container_id:'tv-widget', symbol:'BITSTAMP:BTCUSD', interval:'5',
+    theme:'dark', style:'1', locale:'en', toolbar_bg:'#080C14',
+    enable_publishing:false, autosize:true
   });
 
   let ws, firstPrice=null, prevPrice=null;
@@ -1543,19 +1399,14 @@ HTML_CONTENT = """<!DOCTYPE html>
   function updateCountdown(){
     const now=new Date();
     const gmt3=new Date(now.getTime()+3*3600000);
-    const minutes = gmt3.getUTCMinutes();
-    const seconds = gmt3.getUTCSeconds();
-    const remainingSeconds = (5 - (minutes % 5)) * 60 - seconds;
-    const remaining = Math.max(0, remainingSeconds);
-    const mm = Math.floor(remaining / 60);
-    const ss = String(remaining % 60).padStart(2,'0');
-    document.getElementById('cd-val').textContent = `${mm}:${ss}`;
-    const circ=201;
-    const percent = remaining / 300;
+    const minutes=gmt3.getUTCMinutes(), seconds=gmt3.getUTCSeconds();
+    const remaining=Math.max(0,(5-(minutes%5))*60-seconds);
+    const mm=Math.floor(remaining/60), ss=String(remaining%60).padStart(2,'0');
+    document.getElementById('cd-val').textContent=`${mm}:${ss}`;
     document.getElementById('cd-ring').setAttribute('stroke-dashoffset',
-      String(circ * (1 - percent)));
+      String(201*(1-remaining/300)));
   }
-  updateCountdown(); setInterval(updateCountdown, 1000);
+  updateCountdown(); setInterval(updateCountdown,1000);
 
   function fmt(n){
     if(n==null||n===0)return'--';
@@ -1574,17 +1425,16 @@ HTML_CONTENT = """<!DOCTYPE html>
       document.getElementById('ws-txt').textContent='Disconnected';
       setTimeout(connect,3000);
     };
-    ws.onerror=function(){
-      document.getElementById('ws-dot').className='dot dot-bad';
-    };
+    ws.onerror=function(){ document.getElementById('ws-dot').className='dot dot-bad'; };
     ws.onmessage=function(e){
-      try{handleState(JSON.parse(e.data));}catch(err){}
+      try{ handleState(JSON.parse(e.data)); }catch(err){}
     };
   }
 
   function handleState(d){
     if(d.type==='ping')return;
 
+    // ── Price ──────────────────────────────────────────────────
     const p=d.price;
     if(p&&p>0){
       const priceEl=document.getElementById('price-val');
@@ -1595,53 +1445,71 @@ HTML_CONTENT = """<!DOCTYPE html>
       priceEl.textContent=fmt(p);
       prevPrice=p;
       if(firstPrice===null)firstPrice=p;
-      const chg=p-firstPrice;
-      const pct=(chg/firstPrice*100).toFixed(2);
+      const chg=p-firstPrice, pct=(chg/firstPrice*100).toFixed(2);
       const chgEl=document.getElementById('price-change');
       chgEl.textContent=(chg>=0?'+':'')+fmt(chg)+' ('+pct+'%)';
       chgEl.style.color=chg>=0?'#00E5A0':'#FF4560';
     }
 
+    // ── Prediction ────────────────────────────────────────────
     const sig=d.signal||'HOLD';
-    const isUp=sig==='UP',isDn=sig==='DOWN';
+    const isUp=sig==='UP', isDn=sig==='DOWN', isHold=sig==='HOLD';
     const col=isUp?'#00E5A0':isDn?'#FF4560':'#4A6080';
-    document.getElementById('pred-arrow').textContent=isUp?'▲':isDn?'▼':'◆';
-    document.getElementById('pred-arrow').style.color=col;
-    document.getElementById('pred-dir').textContent=isUp?'UP':isDn?'DOWN':'HOLD';
-    document.getElementById('pred-dir').style.color=col;
-    document.getElementById('conf-pct').textContent=(isUp||isDn)?d.confidence+'%':'--%';
-    document.getElementById('conf-pct').style.color=col;
-    document.getElementById('conf-bar').style.width=(d.confidence||0)+'%';
-    document.getElementById('conf-bar').style.background=col;
-    document.getElementById('pred-window').textContent=d.next_window?'Next: '+d.next_window:'';
 
-    if(d.ohlc){
-      document.getElementById('o-open').textContent=fmt(d.ohlc.open);
-      document.getElementById('o-high').textContent=fmt(d.ohlc.high);
-      document.getElementById('o-low').textContent=fmt(d.ohlc.low);
-      document.getElementById('o-close').textContent=fmt(d.ohlc.close);
+    document.getElementById('pred-arrow').textContent = isUp?'▲':isDn?'▼':'◆';
+    document.getElementById('pred-arrow').style.color  = col;
+    document.getElementById('pred-dir').textContent    = isUp?'UP':isDn?'DOWN':'HOLD';
+    document.getElementById('pred-dir').style.color    = col;
+
+    // Confidence: show "--" for HOLD, "%"" for UP/DOWN
+    const confEl=document.getElementById('conf-pct');
+    if(isHold){
+      confEl.textContent='--'; confEl.style.color='#4A6080';
+    }else{
+      confEl.textContent=d.confidence+'%'; confEl.style.color=col;
     }
 
-    const w=d.wins||0,l=d.losses||0,tot=w+l;
-    document.getElementById('p-wins').textContent=w;
-    document.getElementById('p-losses').textContent=l;
-    document.getElementById('p-acc').textContent=tot?(w/tot*100).toFixed(1)+'%':'--%';
+    // Confidence bar: empty for HOLD
+    document.getElementById('conf-bar').style.width     = isHold?'0%':(d.confidence||0)+'%';
+    document.getElementById('conf-bar').style.background= col;
+    document.getElementById('pred-window').textContent  = d.next_window?'Next: '+d.next_window:'';
 
+    // ── OHLC ──────────────────────────────────────────────────
+    if(d.ohlc){
+      document.getElementById('o-open').textContent  = fmt(d.ohlc.open);
+      document.getElementById('o-high').textContent  = fmt(d.ohlc.high);
+      document.getElementById('o-low').textContent   = fmt(d.ohlc.low);
+      document.getElementById('o-close').textContent = fmt(d.ohlc.close);
+    }
+
+    // ── Performance: only UP/DOWN count ──────────────────────
+    const w=d.wins||0, l=d.losses||0, tot=w+l;
+    document.getElementById('p-wins').textContent   = w;
+    document.getElementById('p-losses').textContent = l;
+    document.getElementById('p-acc').textContent    = tot?(w/tot*100).toFixed(1)+'%':'--';
+
+    // ── History table ─────────────────────────────────────────
     const tbody=document.getElementById('history-body');
     if(d.table&&d.table.length){
       tbody.innerHTML=d.table.map(function(r){
-        const predCls=r.predicted==='UP'?'up':r.predicted==='DOWN'?'down':'';
-        const actCls=r.actual==='UP'?'up':r.actual==='DOWN'?'down':'';
-        const predTxt=r.predicted==='UP'?'▲ UP':r.predicted==='DOWN'?'▼ DOWN':r.predicted;
-        const actTxt=r.actual==='⏳'?'--':r.actual==='UP'?'▲ UP':r.actual==='DOWN'?'▼ DOWN':r.actual;
+        const isHoldPred = r.predicted==='HOLD';
+        const predCls = r.predicted==='UP'?'up':r.predicted==='DOWN'?'down':'hold-clr';
+        const actCls  = r.actual==='UP'   ?'up':r.actual==='DOWN'    ?'down':'';
+        const predTxt = r.predicted==='UP'?'▲ UP':r.predicted==='DOWN'?'▼ DOWN':'◆ HOLD';
+        const actTxt  = r.actual==='⏳'  ?'--'  :r.actual==='UP'?'▲ UP':r.actual==='DOWN'?'▼ DOWN':r.actual;
+        // Confidence cell: "--" for HOLD
+        const confTxt = isHoldPred ? '--' : r.confidence+'%';
+        const confCol = isHoldPred ? '#4A6080' : '#F7931A';
+        // Result cell: "—" means HOLD (skipped), not a win/loss
+        const resTxt  = r.result==='⏳'?'⏳':r.result==='—'?'—':r.result;
         return '<tr>'
           +'<td style="color:#4A6080">'+r.window+'</td>'
           +'<td class="'+predCls+'">'+predTxt+'</td>'
-          +'<td style="color:#F7931A">'+r.confidence+'%</td>'
+          +'<td style="color:'+confCol+'">'+confTxt+'</td>'
           +'<td>'+fmt(r.act_open)+'</td>'
           +'<td>'+fmt(r.act_close)+'</td>'
           +'<td class="'+actCls+'">'+actTxt+'</td>'
-          +'<td>'+(r.result==='⏳'?'--':r.result)+'</td>'
+          +'<td>'+(resTxt)+'</td>'
           +'</tr>';
       }).join('');
     }else{
@@ -1656,7 +1524,7 @@ HTML_CONTENT = """<!DOCTYPE html>
 
 
 # ============================================================
-# FASTAPI APPLICATION  (unchanged from original)
+# FASTAPI APPLICATION
 # ============================================================
 @asynccontextmanager
 async def lifespan(application: FastAPI):
@@ -1678,7 +1546,7 @@ async def lifespan(application: FastAPI):
             model = saved_model
         if mw > wins:
             wins, losses = mw, ml
-        logger.info(f"Loaded hybrid ensemble — {wins}W / {losses}L")
+        logger.info(f"Loaded adaptive ensemble — {wins}W / {losses}L")
 
     saved_preds = load_predictions(5)
     if saved_preds:
@@ -1714,11 +1582,13 @@ async def lifespan(application: FastAPI):
 
     asyncio.create_task(_periodic_broadcast())
 
+    lgb_status = "LightGBM" if HAS_LGB else "LightGBM (missing)"
     logger.info("=" * 60)
-    logger.info("BTC Hybrid Predictor — ready")
-    logger.info(f"Models   : LSTM + GRU-Attention (TFT-inspired) + XGBoost")
+    logger.info("BTC Adaptive Predictor v3.0 — ready")
+    logger.info(f"Models   : BiLSTM + AttentionGRU + XGBoost + RandomForest + {lgb_status}")
     logger.info(f"Features : {N_FEATURES}  |  Seq len : {SEQ_LEN}  |  History : {HISTORY_LIMIT}")
     logger.info(f"Thresholds: UP ≥ {SIGNAL_UP_THRESH}  DOWN ≤ {SIGNAL_DOWN_THRESH}")
+    logger.info(f"HOLD : confidence shown as '--', never counted in accuracy")
     logger.info(f"Stats    : {wins}W / {losses}L")
     logger.info("=" * 60)
     yield
@@ -1733,9 +1603,11 @@ async def lifespan(application: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return HTML_CONTENT
+
 
 @app.websocket("/ws")
 async def ws_endpoint(websocket: WebSocket):
