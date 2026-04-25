@@ -74,7 +74,8 @@ def init_database():
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS predictions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            window_time TEXT,
+            window_start TEXT,
+            window_end TEXT,
             predicted_signal TEXT,
             confidence INTEGER,
             actual_signal TEXT,
@@ -152,19 +153,20 @@ def save_prediction(prediction: dict):
     cursor = conn.cursor()
     try:
         cursor.execute('''
-            INSERT INTO predictions (window_time, predicted_signal, confidence, actual_signal, actual_open, actual_close, result)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (prediction["window"], prediction["predicted"], prediction["confidence"], 
+            INSERT INTO predictions (window_start, window_end, predicted_signal, confidence, actual_signal, actual_open, actual_close, result)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (prediction["window_start"], prediction["window_end"], 
+              prediction["predicted"], prediction["confidence"], 
               prediction.get("actual", "⏳"), prediction.get("act_open", 0), 
               prediction.get("act_close", 0), prediction.get("result", "⏳")))
         conn.commit()
-        logger.info(f"Saved prediction for {prediction['window']}")
+        logger.info(f"Saved prediction for {prediction['window_start']}-{prediction['window_end']}")
     except Exception as e:
         logger.error(f"Failed to save prediction: {e}")
     finally:
         conn.close()
 
-def update_prediction_result(window_time: str, actual_signal: str, actual_open: float, actual_close: float, result: str):
+def update_prediction_result(window_start: str, window_end: str, actual_signal: str, actual_open: float, actual_close: float, result: str):
     """Update prediction with actual result"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -172,10 +174,10 @@ def update_prediction_result(window_time: str, actual_signal: str, actual_open: 
         cursor.execute('''
             UPDATE predictions 
             SET actual_signal = ?, actual_open = ?, actual_close = ?, result = ?
-            WHERE window_time = ?
-        ''', (actual_signal, actual_open, actual_close, result, window_time))
+            WHERE window_start = ? AND window_end = ?
+        ''', (actual_signal, actual_open, actual_close, result, window_start, window_end))
         conn.commit()
-        logger.info(f"Updated prediction result for {window_time}: {result}")
+        logger.info(f"Updated prediction result for {window_start}-{window_end}: {result}")
     except Exception as e:
         logger.error(f"Failed to update prediction: {e}")
     finally:
@@ -186,7 +188,7 @@ def load_predictions(limit: int = 5) -> List[dict]:
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('''
-        SELECT window_time, predicted_signal, confidence, actual_signal, actual_open, actual_close, result
+        SELECT window_start, window_end, predicted_signal, confidence, actual_signal, actual_open, actual_close, result
         FROM predictions 
         ORDER BY id DESC 
         LIMIT ?
@@ -195,15 +197,17 @@ def load_predictions(limit: int = 5) -> List[dict]:
     conn.close()
     
     predictions = []
-    for row in rows:  # Already in DESC order (newest first)
+    for row in rows:
         predictions.append({
-            "window": row[0],
-            "predicted": row[1],
-            "confidence": row[2],
-            "actual": row[3] if row[3] else "⏳",
-            "act_open": row[4] or 0,
-            "act_close": row[5] or 0,
-            "result": row[6] if row[6] else "⏳"
+            "window_start": row[0],
+            "window_end": row[1],
+            "window": f"{row[0]}-{row[1]}",  # Combined for display
+            "predicted": row[2],
+            "confidence": row[3],
+            "actual": row[4] if row[4] else "⏳",
+            "act_open": row[5] or 0,
+            "act_close": row[6] or 0,
+            "result": row[7] if row[7] else "⏳"
         })
     return predictions
 
@@ -292,6 +296,16 @@ _clients_lock: Optional[asyncio.Lock]             = None
 _main_loop:    Optional[asyncio.AbstractEventLoop] = None
 
 # ============================================================
+# HELPER FUNCTIONS
+# ============================================================
+def get_window_time_range(timestamp: float) -> tuple:
+    """Get start and end time strings for a window"""
+    dt = datetime.fromtimestamp(timestamp, tz=TZ)
+    start = dt.strftime("%H:%M")
+    end = (dt + timedelta(minutes=5)).strftime("%H:%M")
+    return start, end
+
+# ============================================================
 # SYNTHETIC HISTORY
 # ============================================================
 def generate_synthetic_history(n: int = 60) -> List[dict]:
@@ -341,6 +355,7 @@ def make_features(candles: List[dict]) -> Optional[pd.DataFrame]:
 def train_model_from_candles(candles: List[dict]) -> None:
     global model
     if len(candles) < MIN_CANDLES_TRAIN + 2:
+        logger.warning(f"Not enough candles for training: {len(candles)}")
         return
     try:
         features_df = make_features(candles[:-1])
@@ -390,15 +405,15 @@ def predict_from_candles(candles: List[dict]) -> dict:
         if   up_p > 0.55: signal = "UP"
         elif up_p < 0.45: signal = "DOWN"
         else:             signal = "HOLD"
-        now      = datetime.now(TZ)
-        next_min = ((now.minute // 5) + 1) * 5
-        delta    = timedelta(
-            minutes      = next_min - now.minute,
-            seconds      = -now.second,
-            microseconds = -now.microsecond,
-        )
-        nxt_time = (now + delta).strftime("%H:%M")
-        return {"signal": signal, "confidence": conf, "next_window": nxt_time}
+        
+        # Get next window time range
+        now = datetime.now(TZ)
+        next_minute = ((now.minute // 5) + 1) * 5
+        next_start = now.replace(minute=0, second=0, microsecond=0) + timedelta(minutes=next_minute)
+        next_end = next_start + timedelta(minutes=5)
+        nxt_range = f"{next_start.strftime('%H:%M')}-{next_end.strftime('%H:%M')}"
+        
+        return {"signal": signal, "confidence": conf, "next_window": nxt_range}
     except Exception as exc:
         logger.error(f"Prediction error: {exc}")
         return default
@@ -408,19 +423,26 @@ def predict_from_candles(candles: List[dict]) -> dict:
 # ============================================================
 def process_price_tick(price: float, trade_ts: float) -> None:
     global live_candle, live_window_start, candles_since_retrain, wins, losses
+    
     with state_lock:
+        # Calculate current window start timestamp
+        current_window_start = int(trade_ts // WINDOW_SECONDS) * WINDOW_SECONDS
+        
+        # If we don't have a live window or we've moved to a new window
         if live_window_start is None:
-            live_window_start = trade_ts - (trade_ts % WINDOW_SECONDS)
-        if trade_ts >= live_window_start + WINDOW_SECONDS:
+            live_window_start = current_window_start
+            live_candle = _new_candle(live_window_start, price)
+        elif current_window_start > live_window_start:
+            # Window has ended - close it
             if live_candle is not None:
                 _close_current_window_locked()
-            live_window_start = trade_ts - (trade_ts % WINDOW_SECONDS)
+            # Start new window
+            live_window_start = current_window_start
             live_candle = _new_candle(live_window_start, price)
-        elif live_candle is None:
-            live_candle = _new_candle(live_window_start, price)
-        else:
-            live_candle["high"]  = max(live_candle["high"],  price)
-            live_candle["low"]   = min(live_candle["low"],   price)
+        elif live_candle is not None:
+            # Update current candle
+            live_candle["high"] = max(live_candle["high"], price)
+            live_candle["low"] = min(live_candle["low"], price)
             live_candle["close"] = price
 
 def _new_candle(ts: float, price: float) -> dict:
@@ -428,21 +450,28 @@ def _new_candle(ts: float, price: float) -> dict:
 
 def _close_current_window_locked() -> None:
     global live_candle, candles_since_retrain, wins, losses
-    candle       = dict(live_candle)
-    live_candle  = None
+    
+    candle = dict(live_candle)
+    live_candle = None
     completed_candles.append(candle)
     candles_since_retrain += 1
     
     # Save candle to database
     save_candle(candle)
-
-    # Update prediction with actual result
-    for row in history_rows:  # Iterate forward, find first pending
-        if row.get("actual") == "⏳":
-            actual           = "UP" if candle["close"] > candle["open"] else "DOWN"
-            row["actual"]    = actual
-            row["act_open"]  = candle["open"]
+    
+    # Get window time range
+    window_start, window_end = get_window_time_range(candle["ts"])
+    
+    # Find and update the pending prediction for this window
+    for row in history_rows:
+        if row.get("actual") == "⏳" and row.get("window_start") == window_start:
+            actual = "UP" if candle["close"] > candle["open"] else "DOWN"
+            row["actual"] = actual
+            row["act_open"] = candle["open"]
             row["act_close"] = candle["close"]
+            row["window_end"] = window_end
+            row["window"] = f"{window_start}-{window_end}"
+            
             if row["predicted"] == actual:
                 row["result"] = "✅"
                 wins += 1
@@ -451,16 +480,25 @@ def _close_current_window_locked() -> None:
                 losses += 1
             
             # Update in database
-            update_prediction_result(row["window"], actual, candle["open"], candle["close"], row["result"])
+            update_prediction_result(window_start, window_end, actual, candle["open"], candle["close"], row["result"])
             save_stats(wins, losses)
+            logger.info(f"Window {window_start}-{window_end}: Predicted {row['predicted']}, Actual {actual} - {row['result']}")
             break
-
+    
+    # Create prediction for NEXT window
     snap = list(completed_candles)
     pred = predict_from_candles(snap)
-    dt   = datetime.fromtimestamp(candle["ts"], tz=TZ).strftime("%H:%M")
+    
+    # Get next window times
+    next_start_dt = datetime.fromtimestamp(candle["ts"] + WINDOW_SECONDS, tz=TZ)
+    next_end_dt = next_start_dt + timedelta(minutes=5)
+    next_window_start = next_start_dt.strftime("%H:%M")
+    next_window_end = next_end_dt.strftime("%H:%M")
     
     prediction_record = {
-        "window": dt,
+        "window_start": next_window_start,
+        "window_end": next_window_end,
+        "window": f"{next_window_start}-{next_window_end}",
         "predicted": pred["signal"],
         "confidence": pred["confidence"],
         "act_open": 0.0,
@@ -468,6 +506,7 @@ def _close_current_window_locked() -> None:
         "actual": "⏳",
         "result": "⏳"
     }
+    
     # Insert at beginning for newest-first display
     history_rows.insert(0, prediction_record)
     save_prediction(prediction_record)
@@ -476,11 +515,11 @@ def _close_current_window_locked() -> None:
     while len(history_rows) > 5:
         history_rows.pop()
     
-    # Save model if needed
+    # Retrain if needed
     if candles_since_retrain >= RETRAIN_EVERY:
         candles_since_retrain = 0
         threading.Thread(
-            target=train_model_from_candles, args=(snap,), daemon=True
+            target=train_model_from_candles, args=(list(completed_candles),), daemon=True
         ).start()
 
 # ============================================================
@@ -496,7 +535,6 @@ def _coinbase_thread() -> None:
             def on_open(ws_obj):
                 nonlocal retry_delay
                 retry_delay = 2
-                # Subscribe to ticker channel for real-time updates
                 subscribe_msg = json.dumps({
                     "type": "subscribe",
                     "product_ids": ["BTC-USD"],
@@ -562,8 +600,8 @@ async def _periodic_broadcast() -> None:
         await _broadcast_state()
 
 async def _broadcast_state() -> None:
-    payload  = _build_state_payload()
-    msg      = json.dumps(payload)
+    payload = _build_state_payload()
+    msg = json.dumps(payload)
     async with _clients_lock:
         snapshot = list(_clients)
     dead = []
@@ -581,32 +619,32 @@ async def _broadcast_state() -> None:
 def _build_state_payload() -> dict:
     with state_lock:
         snap = list(completed_candles)
-        lc   = dict(live_candle) if live_candle else None
+        lc = dict(live_candle) if live_candle else None
         w, l = wins, losses
         rows = list(history_rows[:5])  # Get first 5 (newest first)
 
-    pred       = predict_from_candles(snap) if snap else \
-                 {"signal": "HOLD", "confidence": 0, "next_window": ""}
-    ohlc       = ({k: round(lc[k], 2) for k in ("open", "high", "low", "close")} if lc else {})
+    pred = predict_from_candles(snap) if snap else \
+           {"signal": "HOLD", "confidence": 0, "next_window": ""}
+    ohlc = ({k: round(lc[k], 2) for k in ("open", "high", "low", "close")} if lc else {})
     live_price = lc["close"] if lc else (snap[-1]["close"] if snap else 0.0)
 
     with model_lock:
         model_ready = model is not None
 
     return {
-        "price":       round(live_price, 2),
-        "signal":      pred["signal"],
-        "confidence":  pred["confidence"],
+        "price": round(live_price, 2),
+        "signal": pred["signal"],
+        "confidence": pred["confidence"],
         "next_window": pred["next_window"],
-        "wins":        w,
-        "losses":      l,
-        "ohlc":        ohlc,
-        "table":       rows,
+        "wins": w,
+        "losses": l,
+        "ohlc": ohlc,
+        "table": rows,
         "model_ready": model_ready,
     }
 
 # ============================================================
-# HTML FRONTEND - Fully Responsive with Mobile Support
+# HTML FRONTEND - UPDATED with time ranges
 # ============================================================
 HTML_CONTENT = """<!DOCTYPE html>
 <html lang="en">
@@ -636,7 +674,6 @@ HTML_CONTENT = """<!DOCTYPE html>
     padding: 12px;
   }
   
-  /* Header Styles - Center Aligned */
   .header {
     margin-bottom: 12px;
     padding: 8px 0;
@@ -651,7 +688,6 @@ HTML_CONTENT = """<!DOCTYPE html>
     padding: 4px 0;
   }
   
-  /* Status Bar */
   .status-bar {
     display: flex;
     align-items: center;
@@ -694,7 +730,6 @@ HTML_CONTENT = """<!DOCTYPE html>
     50% { opacity: 0.4; }
   }
   
-  /* Main Grid - Responsive */
   .main-grid {
     display: grid;
     grid-template-columns: 1fr 340px;
@@ -732,7 +767,6 @@ HTML_CONTENT = """<!DOCTYPE html>
     flex: 0 0 auto;
   }
   
-  /* Cards */
   .card {
     background: #0D1421;
     border: 1px solid #1E2D45;
@@ -748,7 +782,6 @@ HTML_CONTENT = """<!DOCTYPE html>
     margin-bottom: 8px;
   }
   
-  /* Price Display */
   .price {
     font-size: 2rem;
     font-weight: 700;
@@ -760,7 +793,6 @@ HTML_CONTENT = """<!DOCTYPE html>
     margin-left: 6px;
   }
   
-  /* Prediction Display */
   .pred-row {
     display: flex;
     align-items: center;
@@ -792,7 +824,6 @@ HTML_CONTENT = """<!DOCTYPE html>
     transition: width 0.4s ease;
   }
   
-  /* Countdown */
   .countdown {
     display: flex;
     align-items: center;
@@ -811,7 +842,6 @@ HTML_CONTENT = """<!DOCTYPE html>
     color: #F7931A;
   }
   
-  /* Bottom Row */
   .bottom-row {
     display: grid;
     gap: 12px;
@@ -819,7 +849,6 @@ HTML_CONTENT = """<!DOCTYPE html>
     margin-bottom: 12px;
   }
   
-  /* OHLC Grid */
   .ohlc-grid {
     display: grid;
     grid-template-columns: 1fr 1fr;
@@ -845,7 +874,6 @@ HTML_CONTENT = """<!DOCTYPE html>
     margin-top: 2px;
   }
   
-  /* Performance Stats */
   .perf-row {
     display: flex;
     gap: 10px;
@@ -872,7 +900,6 @@ HTML_CONTENT = """<!DOCTYPE html>
     margin-top: 2px;
   }
   
-  /* Table Styles */
   .table-wrapper {
     overflow-x: auto;
     margin-top: 10px;
@@ -903,7 +930,6 @@ HTML_CONTENT = """<!DOCTYPE html>
     color: #FF4560;
   }
   
-  /* Disclaimer */
   .disclaimer {
     background: #0F1623;
     border-radius: 8px;
@@ -915,7 +941,6 @@ HTML_CONTENT = """<!DOCTYPE html>
     margin-top: 12px;
   }
   
-  /* Price Flash Animations */
   .flash-up {
     animation: flashUp 0.4s ease;
   }
@@ -934,11 +959,6 @@ HTML_CONTENT = """<!DOCTYPE html>
     50% { color: #FF4560; }
   }
   
-  /* ============================================================ */
-  /* MEDIA QUERIES FOR MOBILE DEVICES */
-  /* ============================================================ */
-  
-  /* Tablet and smaller desktop */
   @media (max-width: 900px) {
     .main-grid {
       grid-template-columns: 1fr;
@@ -969,7 +989,6 @@ HTML_CONTENT = """<!DOCTYPE html>
     }
   }
   
-  /* Mobile phones */
   @media (max-width: 600px) {
     .container {
       padding: 8px;
@@ -1047,7 +1066,6 @@ HTML_CONTENT = """<!DOCTYPE html>
     }
   }
   
-  /* Small mobile devices */
   @media (max-width: 380px) {
     .container {
       padding: 6px;
@@ -1180,16 +1198,19 @@ HTML_CONTENT = """<!DOCTYPE html>
   function updateCountdown(){
     const now=new Date();
     const gmt3=new Date(now.getTime()+3*3600000);
-    const sec=gmt3.getUTCSeconds()+gmt3.getUTCMinutes()%5*60;
-    const remaining=300-sec%300;
-    const mm=Math.floor(remaining/60);
-    const ss=String(remaining%60).padStart(2,'0');
-    document.getElementById('cd-val').textContent=mm+':'+ss;
+    const minutes = gmt3.getUTCMinutes();
+    const seconds = gmt3.getUTCSeconds();
+    const remainingSeconds = (5 - (minutes % 5)) * 60 - seconds;
+    const remaining = Math.max(0, remainingSeconds);
+    const mm = Math.floor(remaining / 60);
+    const ss = String(remaining % 60).padStart(2,'0');
+    document.getElementById('cd-val').textContent = `${mm}:${ss}`;
     const circ=201;
+    const percent = remaining / 300;
     document.getElementById('cd-ring').setAttribute('stroke-dashoffset',
-      String(circ*(1-(remaining/300))));
+      String(circ * (1 - percent)));
   }
-  updateCountdown(); setInterval(updateCountdown,1000);
+  updateCountdown(); setInterval(updateCountdown, 1000);
 
   function fmt(n){
     if(n==null||n===0)return'--';
@@ -1313,14 +1334,13 @@ async def lifespan(application: FastAPI):
     if saved_model:
         with model_lock:
             model = saved_model
-        # Use the stats from model if they're higher (more recent)
         if model_wins > wins:
             wins = model_wins
             losses = model_losses
         logger.info(f"Loaded model with {wins} wins, {losses} losses")
     
-    # Load saved predictions (newest first)
-    saved_predictions = load_predictions(5)  # Only need last 5 for display
+    # Load saved predictions
+    saved_predictions = load_predictions(5)
     if saved_predictions:
         with state_lock:
             history_rows = saved_predictions
@@ -1350,14 +1370,12 @@ async def lifespan(application: FastAPI):
     else:
         logger.info(f"Using existing model with {len(completed_candles)} candles loaded")
     
-    # Force save stats immediately to ensure they persist
     save_stats(wins, losses)
     
     # Start threads
     threading.Thread(target=price_processor_thread, name="price-proc", daemon=True).start()
     threading.Thread(target=_coinbase_thread, name="coinbase-ws", daemon=True).start()
     
-    # Periodic broadcast
     asyncio.create_task(_periodic_broadcast())
 
     port = os.environ.get("PORT", "8000")
@@ -1367,7 +1385,6 @@ async def lifespan(application: FastAPI):
     logger.info("=" * 52)
     yield
     
-    # Save final state on shutdown
     if model:
         save_model(model, wins, losses)
     save_stats(wins, losses)
