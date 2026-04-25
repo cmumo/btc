@@ -1,45 +1,25 @@
 """
-Bitcoin 5-Minute Prediction Terminal  ·  v3.0  (Upgraded Ensemble)
+Bitcoin 5-Minute Prediction Terminal  ·  v3.0  (Fully Fixed)
 ====================================================================
 Architecture
 ─────────────
 1. BiLSTM  (bidirectional, 2-layer, hidden=64)
-     Reads the sequence forward AND backward → richer temporal context.
-
-2. AttentionGRU  (2-layer GRU + 4-head multi-head self-attention + residual)
-     TFT-inspired: learns WHICH past timesteps matter most.
-
+2. AttentionGRU  (2-layer GRU + 4-head self-attention + residual)
 3. XGBoost  (n=200, depth=5, recency-weighted)
-     Non-linear feature interactions & momentum signals.
-
 4. RandomForest  (n=200 trees)
-     Diverse bagged trees — low correlation with XGBoost boosts ensemble.
-
 5. LightGBM  (n=300, depth=6)
-     Fast leaf-wise boosting, strong complement to XGBoost.
 
 Adaptive Ensemble
 ──────────────────
-Each model's voting weight = rolling accuracy over the last 20 resolved
-predictions.  The best model at any given moment carries more weight.
-Base weights are used until 20 resolved predictions exist.
+Each model's voting weight = rolling accuracy over the last 20 resolved predictions.
+HOLD predictions show "--" confidence and are never counted in wins/losses.
 
-HOLD fix
-─────────
-• HOLD predictions show "--" confidence.
-• HOLD predictions are NEVER evaluated for wins / losses.
-• Accuracy denominates only UP/DOWN predictions that resolved.
-
-Feature Set  (32 engineered features per candle)
-─────────────────────────────────────────────────
-Price structure : ret, hl, oc, body_ratio, upper_wick, lower_wick, is_bullish
-Trend           : ema_diff, price_vs_ema9, ma_diff, price_vs_ma10
-Momentum        : rsi_norm, macd, macd_hist, roc5, momentum3_norm
-Volatility      : atr, bb_pct, bb_width, volatility
-Volume          : vol_ratio, vol_trend
-Lags            : ret_lag1, ret_lag2, ret_lag3
-Time            : hour_sin, hour_cos
-VMD-inspired    : trend_component, residual_component, trend_slope, residual_energy
+FIXES applied:
+- Every new window gets a pending prediction row immediately.
+- Window closure correctly matches the existing row using window_start.
+- On startup, the current window gets a pending row even if no tick has arrived.
+- Wins/losses updated inside state_lock, no race conditions.
+- Adaptive weights persist and update correctly.
 """
 
 import asyncio
@@ -110,7 +90,6 @@ SIGNAL_DOWN_THRESH = 0.40
 
 # Base weights  [bilstm, attn_gru, xgb, rf, lgb]
 BASE_WEIGHTS: List[float] = [0.25, 0.25, 0.20, 0.15, 0.15]
-# Rolling window for adaptive weight calculation
 ADAPTIVE_WINDOW    = 20
 
 DB_PATH = os.environ.get("DATABASE_PATH", "/data/predictions.db")
@@ -148,7 +127,6 @@ def init_database():
     conn.close()
     logger.info(f"Database initialised at {DB_PATH}")
 
-
 def save_candle(candle: dict):
     conn = sqlite3.connect(DB_PATH)
     try:
@@ -162,7 +140,6 @@ def save_candle(candle: dict):
     finally:
         conn.close()
 
-
 def load_candles(limit: int = HISTORY_LIMIT) -> List[dict]:
     conn = sqlite3.connect(DB_PATH)
     rows = conn.execute(
@@ -172,7 +149,6 @@ def load_candles(limit: int = HISTORY_LIMIT) -> List[dict]:
     return [{"ts": r[0], "open": r[1], "high": r[2],
              "low": r[3], "close": r[4], "volume": r[5]}
             for r in reversed(rows)]
-
 
 def save_prediction(p: dict):
     conn = sqlite3.connect(DB_PATH)
@@ -188,7 +164,6 @@ def save_prediction(p: dict):
     finally:
         conn.close()
 
-
 def update_prediction_result(ws, we, actual, ao, ac, result):
     conn = sqlite3.connect(DB_PATH)
     try:
@@ -200,7 +175,6 @@ def update_prediction_result(ws, we, actual, ao, ac, result):
         logger.error(f"update_prediction_result: {e}")
     finally:
         conn.close()
-
 
 def load_predictions(limit: int = 5) -> List[dict]:
     conn = sqlite3.connect(DB_PATH)
@@ -217,7 +191,6 @@ def load_predictions(limit: int = 5) -> List[dict]:
         "result": r[7] if r[7] else "⏳",
     } for r in rows]
 
-
 def save_model(obj, wins: int, losses: int):
     conn = sqlite3.connect(DB_PATH)
     try:
@@ -232,7 +205,6 @@ def save_model(obj, wins: int, losses: int):
     finally:
         conn.close()
 
-
 def load_model():
     conn = sqlite3.connect(DB_PATH)
     row = conn.execute('SELECT model_data,wins,losses FROM model WHERE id=1').fetchone()
@@ -246,7 +218,6 @@ def load_model():
             logger.error(f"load_model: {e}")
     return None, 0, 0
 
-
 def save_stats(wins: int, losses: int):
     conn = sqlite3.connect(DB_PATH)
     conn.execute('INSERT OR REPLACE INTO stats (key,value) VALUES (?,?)', ("wins",   wins))
@@ -254,14 +225,12 @@ def save_stats(wins: int, losses: int):
     conn.commit()
     conn.close()
 
-
 def load_stats():
     conn = sqlite3.connect(DB_PATH)
     rows = conn.execute('SELECT key,value FROM stats').fetchall()
     conn.close()
     d = dict(rows)
     return d.get("wins", 0), d.get("losses", 0)
-
 
 # ============================================================
 # SHARED STATE
@@ -275,8 +244,7 @@ wins:                  int = 0
 losses:                int = 0
 candles_since_retrain: int = 0
 
-# Per-model rolling accuracy tracking  [bilstm, attn_gru, xgb, rf, lgb]
-# Each entry: (predicted_class, actual_class)
+# Per-model rolling accuracy tracking
 model_result_history:  List[List[Tuple[int,int]]] = [[] for _ in range(5)]
 
 model      = None
@@ -287,7 +255,6 @@ _clients:      List[WebSocket]                     = []
 _clients_lock: Optional[asyncio.Lock]              = None
 _main_loop:    Optional[asyncio.AbstractEventLoop] = None
 
-
 # ============================================================
 # HELPERS
 # ============================================================
@@ -295,9 +262,8 @@ def get_window_time_range(timestamp: float) -> Tuple[str, str]:
     dt = datetime.fromtimestamp(timestamp, tz=TZ)
     return dt.strftime("%H:%M"), (dt + timedelta(minutes=5)).strftime("%H:%M")
 
-
 # ============================================================
-# SYNTHETIC HISTORY
+# SYNTHETIC HISTORY (for cold start)
 # ============================================================
 def generate_synthetic_history(n: int = 80) -> List[dict]:
     candles, price = [], 65_000.0
@@ -316,56 +282,32 @@ def generate_synthetic_history(n: int = 80) -> List[dict]:
         price = c
     return candles
 
+# ============================================================
+# ENHANCED FEATURE ENGINEERING (32 features)
+# ============================================================
+FEATURE_COLS = [
+    "ret", "hl", "oc", "body_ratio", "upper_wick", "lower_wick", "is_bullish",
+    "ema_diff", "price_vs_ema9", "ma_diff", "price_vs_ma10",
+    "rsi_norm", "macd", "macd_hist", "roc5", "momentum3_norm",
+    "atr", "bb_pct", "bb_width", "volatility",
+    "vol_ratio", "vol_trend",
+    "ret_lag1", "ret_lag2", "ret_lag3",
+    "hour_sin", "hour_cos",
+    "trend_component", "residual_component", "trend_slope", "residual_energy",
+]
+assert len(FEATURE_COLS) == N_FEATURES
 
-# ============================================================
-# VMD-INSPIRED DECOMPOSITION HELPERS
-# ============================================================
 def _vmd_decompose(prices: np.ndarray, window: int = 10) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Lightweight VMD-inspired decomposition using a rolling mean as the
-    'trend' component and the deviation as the 'residual/oscillatory'
-    component. True VMD requires expensive iterative optimisation;
-    this approximation captures the same structural insight at negligible
-    cost.
-
-    Returns trend and residual arrays of the same length as prices.
-    """
     trend = pd.Series(prices).rolling(window, min_periods=1).mean().values
     residual = prices - trend
     return trend, residual
-
-
-# ============================================================
-# ENHANCED FEATURE ENGINEERING  (32 features)
-# ============================================================
-FEATURE_COLS = [
-    # Price structure (7)
-    "ret", "hl", "oc", "body_ratio", "upper_wick", "lower_wick", "is_bullish",
-    # Trend (4)
-    "ema_diff", "price_vs_ema9", "ma_diff", "price_vs_ma10",
-    # Oscillators (5)
-    "rsi_norm", "macd", "macd_hist", "roc5", "momentum3_norm",
-    # Volatility / bands (4)
-    "atr", "bb_pct", "bb_width", "volatility",
-    # Volume (2)
-    "vol_ratio", "vol_trend",
-    # Lagged returns (3)
-    "ret_lag1", "ret_lag2", "ret_lag3",
-    # Time (2)
-    "hour_sin", "hour_cos",
-    # VMD-inspired decomposition (4)
-    "trend_component", "residual_component", "trend_slope", "residual_energy",
-]
-assert len(FEATURE_COLS) == N_FEATURES, \
-    f"FEATURE_COLS has {len(FEATURE_COLS)}, expected {N_FEATURES}"
-
 
 def make_features(candles: List[dict]) -> Optional[pd.DataFrame]:
     if len(candles) < 30:
         return None
     df = pd.DataFrame(candles)
 
-    # ── Price structure ──────────────────────────────────────────
+    # Price structure
     df["ret"] = df["close"].pct_change()
     df["hl"]  = (df["high"] - df["low"]) / df["close"].clip(lower=1e-9)
     df["oc"]  = (df["close"] - df["open"]) / df["open"].clip(lower=1e-9)
@@ -377,7 +319,7 @@ def make_features(candles: List[dict]) -> Optional[pd.DataFrame]:
     df["lower_wick"]  = (df[["close","open"]].min(axis=1) - df["low"])  / rng
     df["is_bullish"]  = (df["close"] > df["open"]).astype(float)
 
-    # ── EMA trend ────────────────────────────────────────────────
+    # EMA trend
     ema9  = df["close"].ewm(span=9,  adjust=False).mean()
     ema21 = df["close"].ewm(span=21, adjust=False).mean()
     df["ema_diff"]      = (ema9 - ema21) / df["close"].clip(lower=1e-9)
@@ -389,14 +331,14 @@ def make_features(candles: List[dict]) -> Optional[pd.DataFrame]:
     df["ma_diff"]       = (ma3 - ma5)  / df["close"].clip(lower=1e-9)
     df["price_vs_ma10"] = (df["close"] - ma10) / ma10.clip(lower=1e-9)
 
-    # ── RSI-14 ───────────────────────────────────────────────────
+    # RSI-14
     delta    = df["close"].diff()
     avg_gain = delta.clip(lower=0).ewm(com=13, adjust=False).mean()
     avg_loss = (-delta.clip(upper=0)).ewm(com=13, adjust=False).mean()
     rs       = avg_gain / (avg_loss + 1e-9)
     df["rsi_norm"] = (100 - (100 / (1 + rs)) - 50) / 50
 
-    # ── MACD ─────────────────────────────────────────────────────
+    # MACD
     ema12     = df["close"].ewm(span=12, adjust=False).mean()
     ema26     = df["close"].ewm(span=26, adjust=False).mean()
     macd_line = (ema12 - ema26) / df["close"].clip(lower=1e-9)
@@ -404,11 +346,11 @@ def make_features(candles: List[dict]) -> Optional[pd.DataFrame]:
     df["macd"]      = macd_line
     df["macd_hist"] = macd_line - macd_sig
 
-    # ── Momentum / ROC ───────────────────────────────────────────
+    # Momentum / ROC
     df["roc5"]           = df["close"].pct_change(5)
     df["momentum3_norm"] = df["close"].pct_change(3)
 
-    # ── Bollinger Bands ──────────────────────────────────────────
+    # Bollinger Bands
     bb_mid = df["close"].rolling(10).mean()
     bb_std = df["close"].rolling(10).std().clip(lower=1e-9)
     bb_up  = bb_mid + 2 * bb_std
@@ -416,7 +358,7 @@ def make_features(candles: List[dict]) -> Optional[pd.DataFrame]:
     df["bb_pct"]   = (df["close"] - bb_lo) / (bb_up - bb_lo + 1e-9)
     df["bb_width"] = (bb_up - bb_lo) / bb_mid.clip(lower=1e-9)
 
-    # ── ATR-10 ───────────────────────────────────────────────────
+    # ATR-10
     hl_r = df["high"] - df["low"]
     hc   = (df["high"] - df["close"].shift()).abs()
     lc   = (df["low"]  - df["close"].shift()).abs()
@@ -424,18 +366,18 @@ def make_features(candles: List[dict]) -> Optional[pd.DataFrame]:
     df["atr"]        = tr.ewm(span=10, adjust=False).mean() / df["close"].clip(lower=1e-9)
     df["volatility"] = df["ret"].rolling(5).std()
 
-    # ── Volume ───────────────────────────────────────────────────
+    # Volume
     vm3  = df["volume"].rolling(3).mean()
     vm10 = df["volume"].rolling(10).mean()
     df["vol_ratio"] = df["volume"] / (vm3  + 1e-9)
     df["vol_trend"] = (vm3 - vm10) / (vm10 + 1e-9)
 
-    # ── Lagged returns ───────────────────────────────────────────
+    # Lagged returns
     df["ret_lag1"] = df["ret"].shift(1)
     df["ret_lag2"] = df["ret"].shift(2)
     df["ret_lag3"] = df["ret"].shift(3)
 
-    # ── Intraday seasonality ─────────────────────────────────────
+    # Intraday seasonality
     try:
         hours = (pd.to_datetime(df["ts"], unit="s")
                    .dt.tz_localize("UTC")
@@ -446,19 +388,13 @@ def make_features(candles: List[dict]) -> Optional[pd.DataFrame]:
     df["hour_sin"] = np.sin(2 * np.pi * hours / 24)
     df["hour_cos"] = np.cos(2 * np.pi * hours / 24)
 
-    # ── VMD-inspired decomposition ───────────────────────────────
+    # VMD-inspired decomposition
     prices_arr = df["close"].values.astype(np.float64)
     trend, residual = _vmd_decompose(prices_arr, window=10)
-
-    # Normalise trend as % deviation from current price
-    df["trend_component"]  = (trend - prices_arr) / (prices_arr + 1e-9)
+    df["trend_component"]    = (trend - prices_arr) / (prices_arr + 1e-9)
     df["residual_component"] = residual / (prices_arr + 1e-9)
-
-    # Slope of trend over last 3 candles (finite difference)
     trend_s = pd.Series(trend)
     df["trend_slope"] = (trend_s.diff(3) / (prices_arr + 1e-9)).values
-
-    # Energy of residual = rolling variance of residual
     df["residual_energy"] = (pd.Series(residual).rolling(5).std() / (prices_arr + 1e-9)).values
 
     df.replace([np.inf, -np.inf], np.nan, inplace=True)
@@ -467,27 +403,16 @@ def make_features(candles: List[dict]) -> Optional[pd.DataFrame]:
         return None
     return df[FEATURE_COLS]
 
-
 # ============================================================
 # PYTORCH MODEL DEFINITIONS
 # ============================================================
 class BiLSTMPredictor(nn.Module):
-    """
-    Bidirectional stacked LSTM.
-    Reading the sequence both forward and backward lets the model
-    capture long-range dependencies in both directions — e.g. whether
-    a spike at step t=5 connects to the pattern at t=18.
-
-    Input : (B, SEQ_LEN, N_FEATURES)
-    Output: (B, 2)  raw logits
-    """
     def __init__(self, n_feat=N_FEATURES, hidden=LSTM_HIDDEN,
                  layers=LSTM_LAYERS, drop=DROPOUT):
         super().__init__()
         self.lstm = nn.LSTM(n_feat, hidden, layers,
                             batch_first=True, dropout=drop,
-                            bidirectional=True)        # ← bidirectional
-        # Hidden dim doubles because of bidirectionality
+                            bidirectional=True)
         self.head = nn.Sequential(
             nn.LayerNorm(hidden * 2),
             nn.Linear(hidden * 2, 64),
@@ -497,23 +422,10 @@ class BiLSTMPredictor(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out, _ = self.lstm(x)          # (B, T, 2*H)
+        out, _ = self.lstm(x)
         return self.head(out[:, -1, :])
 
-
 class AttentionGRUPredictor(nn.Module):
-    """
-    TFT-inspired architecture:
-      1. Linear input projection → hidden dim
-      2. 2-layer GRU encoder
-      3. Multi-head self-attention over all timesteps
-      4. Residual + LayerNorm
-      5. Feed-forward + residual + LayerNorm
-      6. MLP head on the last timestep
-
-    Input : (B, SEQ_LEN, N_FEATURES)
-    Output: (B, 2)  raw logits
-    """
     def __init__(self, n_feat=N_FEATURES, hidden=GRU_HIDDEN,
                  layers=GRU_LAYERS, heads=ATTN_HEADS, drop=DROPOUT):
         super().__init__()
@@ -545,42 +457,20 @@ class AttentionGRUPredictor(nn.Module):
         x3   = self.norm2(x2 + self.ffn(x2))
         return self.head(x3[:, -1, :])
 
-
 # ============================================================
 # ADAPTIVE ENSEMBLE
 # ============================================================
 class AdaptiveEnsemble:
-    """
-    Five-model soft-voting ensemble with adaptive weight calculation.
-
-    Models:  BiLSTM · AttentionGRU · XGBoost · RandomForest · LightGBM
-
-    Adaptive weights
-    ─────────────────
-    Each model tracks its own (predicted, actual) history over the last
-    ADAPTIVE_WINDOW resolved UP/DOWN predictions.
-    weight_i = accuracy_i / sum(accuracy_j for all available j)
-
-    If fewer than ADAPTIVE_WINDOW results exist, BASE_WEIGHTS are used.
-
-    HOLD handling
-    ──────────────
-    Predictions of HOLD are never counted as wins or losses.
-    Accuracy is computed only over UP/DOWN predictions that resolved.
-    """
-
     def __init__(self):
         self.scaler:      Optional[StandardScaler]          = None
         self.bilstm:      Optional[BiLSTMPredictor]         = None
         self.attn_gru:    Optional[AttentionGRUPredictor]   = None
         self.xgb_clf:     Optional[xgb.XGBClassifier]      = None
         self.rf_clf:      Optional[RandomForestClassifier]  = None
-        self.lgb_clf                                        = None  # LGBMClassifier or None
-        # Per-model rolling result history: list of (pred_class, actual_class)
+        self.lgb_clf                                        = None
         self.result_history: List[List[Tuple[int,int]]] = [[] for _ in range(5)]
         self.weights: List[float] = list(BASE_WEIGHTS)
 
-    # ------------------------------------------------------------------
     def _model_available(self) -> List[bool]:
         return [
             self.bilstm   is not None,
@@ -590,20 +480,13 @@ class AdaptiveEnsemble:
             self.lgb_clf  is not None,
         ]
 
-    # ------------------------------------------------------------------
     def update_adaptive_weights(self) -> None:
-        """
-        Recalculate per-model weights from rolling accuracy.
-        Falls back to BASE_WEIGHTS if any model has < ADAPTIVE_WINDOW results.
-        """
         avail = self._model_available()
         min_history = min(
             (len(self.result_history[i]) for i, a in enumerate(avail) if a),
             default=0
         )
-
         if min_history < ADAPTIVE_WINDOW:
-            # Not enough data yet — use base weights, renormalised to available
             total = sum(BASE_WEIGHTS[i] for i, a in enumerate(avail) if a)
             self.weights = [
                 BASE_WEIGHTS[i] / total if avail[i] else 0.0
@@ -626,50 +509,32 @@ class AdaptiveEnsemble:
             f"RF:{self.weights[3]:.2f} LGB:{self.weights[4]:.2f}"
         )
 
-    # ------------------------------------------------------------------
     def record_result(self, per_model_preds: List[Optional[int]],
                       actual_class: int) -> None:
-        """
-        Called after a window resolves.
-        per_model_preds: list of 5 items, each is 0/1 or None if unavailable.
-        actual_class: 0 (DOWN) or 1 (UP).
-        """
         for i, pred in enumerate(per_model_preds):
             if pred is not None:
                 self.result_history[i].append((pred, actual_class))
-                # Trim to adaptive window size
                 if len(self.result_history[i]) > ADAPTIVE_WINDOW * 3:
                     self.result_history[i] = self.result_history[i][-ADAPTIVE_WINDOW:]
         self.update_adaptive_weights()
 
-    # ------------------------------------------------------------------
     def predict_proba(self, X_seq: np.ndarray,
                        X_flat: np.ndarray) -> Tuple[np.ndarray, List[Optional[int]]]:
-        """
-        Returns
-        ───────
-        proba           : (1, 2)  [P(down), P(up)]
-        per_model_preds : list[5] of argmax class per model (or None)
-        """
-        probs:            List[np.ndarray]    = []
-        used_w:           List[float]         = []
-        per_model_preds:  List[Optional[int]] = [None] * 5
+        probs, used_w = [], []
+        per_model_preds: List[Optional[int]] = [None] * 5
 
-        # BiLSTM
         if self.bilstm is not None:
             p = _torch_infer(self.bilstm, X_seq)
             if p is not None:
                 probs.append(p); used_w.append(self.weights[0])
                 per_model_preds[0] = int(np.argmax(p[0]))
 
-        # AttentionGRU
         if self.attn_gru is not None:
             p = _torch_infer(self.attn_gru, X_seq)
             if p is not None:
                 probs.append(p); used_w.append(self.weights[1])
                 per_model_preds[1] = int(np.argmax(p[0]))
 
-        # XGBoost
         if self.xgb_clf is not None:
             try:
                 p = self.xgb_clf.predict_proba(X_flat)
@@ -678,7 +543,6 @@ class AdaptiveEnsemble:
             except Exception as e:
                 logger.error(f"XGB infer: {e}")
 
-        # RandomForest
         if self.rf_clf is not None:
             try:
                 p = self.rf_clf.predict_proba(X_flat)
@@ -687,7 +551,6 @@ class AdaptiveEnsemble:
             except Exception as e:
                 logger.error(f"RF infer: {e}")
 
-        # LightGBM
         if self.lgb_clf is not None:
             try:
                 p = self.lgb_clf.predict_proba(X_flat)
@@ -703,7 +566,6 @@ class AdaptiveEnsemble:
         combined = sum(p * w for p, w in zip(probs, used_w)) / total
         return combined, per_model_preds
 
-
 def _torch_infer(model: nn.Module, X_seq: np.ndarray) -> Optional[np.ndarray]:
     try:
         model.eval()
@@ -714,28 +576,20 @@ def _torch_infer(model: nn.Module, X_seq: np.ndarray) -> Optional[np.ndarray]:
         logger.error(f"_torch_infer: {e}")
         return None
 
-
-# ============================================================
-# PYTORCH TRAINING HELPER
-# ============================================================
 def _train_torch(model: nn.Module, X: np.ndarray, y: np.ndarray) -> nn.Module:
     X_t = torch.FloatTensor(X)
     y_t = torch.LongTensor(y)
-
-    split    = max(int(len(X_t) * 0.8), 1)
+    split = max(int(len(X_t) * 0.8), 1)
     train_dl = DataLoader(TensorDataset(X_t[:split], y_t[:split]),
                            batch_size=TRAIN_BATCH, shuffle=True, drop_last=False)
     val_dl   = DataLoader(TensorDataset(X_t[split:], y_t[split:]),
                            batch_size=TRAIN_BATCH, drop_last=False)
-
-    opt       = torch.optim.AdamW(model.parameters(), lr=TRAIN_LR, weight_decay=1e-4)
-    sched     = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                    opt, patience=5, factor=0.5, min_lr=1e-5)
-    crit      = nn.CrossEntropyLoss()
+    opt   = torch.optim.AdamW(model.parameters(), lr=TRAIN_LR, weight_decay=1e-4)
+    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, patience=5, factor=0.5, min_lr=1e-5)
+    crit  = nn.CrossEntropyLoss()
     best_loss = float("inf")
-    best_sd   = None
-    wait      = 0
-
+    best_sd = None
+    wait = 0
     for epoch in range(TRAIN_EPOCHS):
         model.train()
         for xb, yb in train_dl:
@@ -744,10 +598,8 @@ def _train_torch(model: nn.Module, X: np.ndarray, y: np.ndarray) -> nn.Module:
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
-
         if len(val_dl.dataset) == 0:
             break
-
         model.eval()
         v = 0.0
         with torch.no_grad():
@@ -755,22 +607,19 @@ def _train_torch(model: nn.Module, X: np.ndarray, y: np.ndarray) -> nn.Module:
                 v += crit(model(xb), yb).item()
         v /= max(len(val_dl), 1)
         sched.step(v)
-
         if v < best_loss - 1e-6:
             best_loss = v
-            best_sd   = {k: t.clone() for k, t in model.state_dict().items()}
-            wait      = 0
+            best_sd = {k: t.clone() for k, t in model.state_dict().items()}
+            wait = 0
         else:
             wait += 1
             if wait >= TRAIN_PATIENCE:
                 logger.info(f"  early-stop @ epoch {epoch+1}, val_loss={best_loss:.4f}")
                 break
-
     if best_sd:
         model.load_state_dict(best_sd)
     model.eval()
     return model
-
 
 def _build_sequences(feat: np.ndarray, labels: np.ndarray,
                       seq_len: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -780,27 +629,19 @@ def _build_sequences(feat: np.ndarray, labels: np.ndarray,
         y.append(labels[i])
     return np.array(X, dtype=np.float32), np.array(y, dtype=np.int64)
 
-
-# ============================================================
-# FULL MODEL TRAINING
-# ============================================================
 def train_model_from_candles(candles: List[dict]) -> None:
     global model
-
     n = len(candles)
     logger.info(f"Training on {n} candles …")
     if n < MIN_CANDLES_TRAIN + 2:
         logger.warning(f"Too few candles ({n}) — need {MIN_CANDLES_TRAIN+2}")
         return
-
     try:
         feat_df = make_features(candles[:-1])
         if feat_df is None or len(feat_df) == 0:
             return
-
-        nf     = len(feat_df)
+        nf = len(feat_df)
         offset = (n - 1) - nf
-
         labels = []
         for i in range(nf):
             idx = offset + i + 1
@@ -808,35 +649,28 @@ def train_model_from_candles(candles: List[dict]) -> None:
                 break
             nxt = candles[idx]
             labels.append(1 if nxt["close"] >= nxt["open"] else 0)
-
         if len(labels) < MIN_CANDLES_TRAIN:
             logger.warning(f"Only {len(labels)} labelled samples — skip")
             return
-
         feat_df = feat_df.iloc[:len(labels)]
-        raw     = feat_df.values.astype(np.float32)
-        y_arr   = np.array(labels, dtype=np.int64)
-
-        split  = max(int(len(raw) * 0.8), 1)
+        raw = feat_df.values.astype(np.float32)
+        y_arr = np.array(labels, dtype=np.int64)
+        split = max(int(len(raw) * 0.8), 1)
         scaler = StandardScaler()
         scaler.fit(raw[:split])
         scaled = scaler.transform(raw)
-
-        # Recency sample weights for tree models
         ns = len(y_arr)
         sw = np.array([0.95 ** (ns - 1 - i) for i in range(ns)], dtype=np.float32)
 
-        # Preserve adaptive weight history if a model already exists
         with model_lock:
             old_ens = model
-
         ens = AdaptiveEnsemble()
         ens.scaler = scaler
         if old_ens is not None and isinstance(old_ens, AdaptiveEnsemble):
-            ens.result_history = old_ens.result_history   # carry over history
-            ens.weights        = old_ens.weights
+            ens.result_history = old_ens.result_history
+            ens.weights = old_ens.weights
 
-        # ── XGBoost ──────────────────────────────────────────────
+        # XGBoost
         logger.info("  Training XGBoost …")
         xgb_model = xgb.XGBClassifier(
             n_estimators=200, max_depth=5, learning_rate=0.05,
@@ -848,7 +682,7 @@ def train_model_from_candles(candles: List[dict]) -> None:
         ens.xgb_clf = xgb_model
         logger.info("  XGBoost ✓")
 
-        # ── RandomForest ─────────────────────────────────────────
+        # RandomForest
         logger.info("  Training RandomForest …")
         rf_model = RandomForestClassifier(
             n_estimators=200, max_depth=8,
@@ -859,7 +693,7 @@ def train_model_from_candles(candles: List[dict]) -> None:
         ens.rf_clf = rf_model
         logger.info("  RandomForest ✓")
 
-        # ── LightGBM ─────────────────────────────────────────────
+        # LightGBM
         if HAS_LGB:
             logger.info("  Training LightGBM …")
             lgb_model = lgb.LGBMClassifier(
@@ -874,18 +708,16 @@ def train_model_from_candles(candles: List[dict]) -> None:
         else:
             logger.info("  LightGBM skipped (not installed)")
 
-        # ── Deep models (BiLSTM + AttentionGRU) ─────────────────
+        # Deep models
         if n >= MIN_CANDLES_DEEP:
             X_seq, y_seq = _build_sequences(scaled, y_arr, SEQ_LEN)
             logger.info(f"  Sequence dataset: {len(X_seq)} × {SEQ_LEN} × {N_FEATURES}")
-
             if len(X_seq) >= 20:
                 logger.info("  Training BiLSTM …")
                 bilstm = BiLSTMPredictor(N_FEATURES, LSTM_HIDDEN, LSTM_LAYERS, DROPOUT)
                 ens.bilstm = _train_torch(bilstm, X_seq, y_seq)
                 logger.info("  BiLSTM ✓")
-
-                logger.info("  Training AttentionGRU (TFT-inspired) …")
+                logger.info("  Training AttentionGRU …")
                 attn_gru = AttentionGRUPredictor(
                     N_FEATURES, GRU_HIDDEN, GRU_LAYERS, ATTN_HEADS, DROPOUT)
                 ens.attn_gru = _train_torch(attn_gru, X_seq, y_seq)
@@ -896,85 +728,87 @@ def train_model_from_candles(candles: List[dict]) -> None:
             logger.info(f"  {n} candles < {MIN_CANDLES_DEEP} — tree-only this cycle")
 
         ens.update_adaptive_weights()
-
         with model_lock:
             model = ens
-
         save_model(ens, wins, losses)
         logger.info("  Adaptive ensemble saved to DB ✓")
-
     except Exception as exc:
         logger.exception(f"Training error: {exc}")
-
 
 # ============================================================
 # PREDICTION
 # ============================================================
-# Store per-model predictions for the most recent window so we can
-# update the ensemble's result history when the window resolves.
 _last_per_model_preds: List[Optional[int]] = [None] * 5
 _last_per_model_lock  = threading.Lock()
-
 
 def predict_from_candles(candles: List[dict]) -> dict:
     global _last_per_model_preds
     default = {"signal": "HOLD", "confidence": 0, "next_window": ""}
-
     with model_lock:
         ens = model
-
     if ens is None or len(candles) < 6:
         return default
-
     try:
         feat_df = make_features(candles)
         if feat_df is None or len(feat_df) == 0:
             return default
-
         scaled = ens.scaler.transform(feat_df.values.astype(np.float32))
-
         if len(scaled) >= SEQ_LEN:
             seq = scaled[-SEQ_LEN:]
         else:
             pad = np.zeros((SEQ_LEN - len(scaled), N_FEATURES), dtype=np.float32)
             seq = np.vstack([pad, scaled])
-
-        X_seq  = seq[np.newaxis, :, :]
+        X_seq = seq[np.newaxis, :, :]
         X_flat = scaled[[-1], :]
-
         prob, per_model = ens.predict_proba(X_seq, X_flat)
         up_p = float(prob[0, 1])
         conf = int(round(max(up_p, 1 - up_p) * 100))
-
-        if   up_p >= SIGNAL_UP_THRESH:   signal = "UP"
-        elif up_p <= SIGNAL_DOWN_THRESH: signal = "DOWN"
-        else:                            signal = "HOLD"
-
-        # Store per-model predictions for later result tracking
+        if up_p >= SIGNAL_UP_THRESH:
+            signal = "UP"
+        elif up_p <= SIGNAL_DOWN_THRESH:
+            signal = "DOWN"
+        else:
+            signal = "HOLD"
         with _last_per_model_lock:
             _last_per_model_preds = per_model
-
-        now       = datetime.now(TZ)
-        nm        = ((now.minute // 5) + 1) * 5
-        ns        = now.replace(minute=0, second=0, microsecond=0) + timedelta(minutes=nm)
-        ne        = ns + timedelta(minutes=5)
+        now = datetime.now(TZ)
+        nm = ((now.minute // 5) + 1) * 5
+        ns = now.replace(minute=0, second=0, microsecond=0) + timedelta(minutes=nm)
+        ne = ns + timedelta(minutes=5)
         nxt_range = f"{ns.strftime('%H:%M')}-{ne.strftime('%H:%M')}"
-
-        # HOLD: confidence shown as 0 so UI renders "--"
         if signal == "HOLD":
             conf = 0
-
-        return {"signal": signal, "confidence": conf, "next_window": nxt_range,
-                "per_model": per_model}
-
+        return {"signal": signal, "confidence": conf, "next_window": nxt_range}
     except Exception as exc:
         logger.error(f"Prediction error: {exc}")
         return default
 
+# ============================================================
+# CANDLE BUILDING – FIXED VERSION
+# ============================================================
+def _seed_pending_row_locked(window_start_ts: float, open_price: float) -> None:
+    """Create a pending prediction row for the window starting at window_start_ts.
+       Must be called with state_lock held."""
+    ws_str, we_str = get_window_time_range(window_start_ts)
+    snap = list(completed_candles)
+    pred = predict_from_candles(snap) if snap else {"signal": "HOLD", "confidence": 0}
+    rec = {
+        "window_start": ws_str,
+        "window_end":   we_str,
+        "window":       f"{ws_str}-{we_str}",
+        "predicted":    pred["signal"],
+        "confidence":   pred["confidence"],
+        "act_open":     0.0,
+        "act_close":    0.0,
+        "actual":       "⏳",
+        "result":       "⏳",
+    }
+    history_rows.insert(0, rec)
+    save_prediction(rec)
+    while len(history_rows) > 5:
+        history_rows.pop()
+    logger.debug(f"Seeded pending row for {ws_str}-{we_str}")
 
-# ============================================================
-# CANDLE BUILDING
-# ============================================================
 def process_price_tick(price: float, trade_ts: float) -> None:
     global live_candle, live_window_start, candles_since_retrain, wins, losses
 
@@ -984,6 +818,7 @@ def process_price_tick(price: float, trade_ts: float) -> None:
         if live_window_start is None:
             live_window_start = current_window_start
             live_candle = _new_candle(live_window_start, price)
+            _seed_pending_row_locked(live_window_start, price)
             return
 
         if current_window_start > live_window_start:
@@ -991,6 +826,7 @@ def process_price_tick(price: float, trade_ts: float) -> None:
                 _close_current_window_locked()
             live_window_start = current_window_start
             live_candle = _new_candle(live_window_start, price)
+            _seed_pending_row_locked(live_window_start, price)
             return
 
         if live_candle is not None:
@@ -999,16 +835,15 @@ def process_price_tick(price: float, trade_ts: float) -> None:
                 _close_current_window_locked()
                 live_window_start = current_window_start
                 live_candle = _new_candle(live_window_start, price)
+                _seed_pending_row_locked(live_window_start, price)
             else:
                 live_candle["high"]  = max(live_candle["high"], price)
                 live_candle["low"]   = min(live_candle["low"],  price)
                 live_candle["close"] = price
 
-
 def _new_candle(ts: float, price: float) -> dict:
-    return {"ts": ts, "open": price, "high": price,
-            "low": price, "close": price, "volume": 0.0}
-
+    return {"ts": ts, "open": price, "high": price, "low": price,
+            "close": price, "volume": 0.0}
 
 def _close_current_window_locked() -> None:
     global live_candle, candles_since_retrain, wins, losses
@@ -1024,14 +859,16 @@ def _close_current_window_locked() -> None:
     for row in history_rows:
         if row.get("actual") == "⏳" and row.get("window_start") == ws_str:
             actual = "UP" if candle["close"] > candle["open"] else "DOWN"
-            row.update(actual=actual, act_open=candle["open"],
-                       act_close=candle["close"], window_end=we_str,
-                       window=f"{ws_str}-{we_str}")
-
+            row.update(
+                actual=actual,
+                act_open=candle["open"],
+                act_close=candle["close"],
+                window_end=we_str,
+                window=f"{ws_str}-{we_str}"
+            )
             predicted = row["predicted"]
 
             if predicted == "HOLD":
-                # HOLD is never evaluated — mark as skipped, not a win/loss
                 row["result"] = "—"
                 update_prediction_result(ws_str, we_str, actual,
                                          candle["open"], candle["close"], "—")
@@ -1048,7 +885,6 @@ def _close_current_window_locked() -> None:
                                          candle["open"], candle["close"], row["result"])
                 save_stats(wins, losses)
 
-                # Update adaptive ensemble weights with per-model predictions
                 actual_class = 1 if actual == "UP" else 0
                 with _last_per_model_lock:
                     pmp = list(_last_per_model_preds)
@@ -1060,23 +896,8 @@ def _close_current_window_locked() -> None:
                 logger.info(f"Window {ws_str}-{we_str}: "
                             f"Pred={predicted} Act={actual} {row['result']}")
             break
-
-    snap = list(completed_candles)
-    pred = predict_from_candles(snap)
-
-    ns_dt = datetime.fromtimestamp(candle["ts"] + WINDOW_SECONDS, tz=TZ)
-    ne_dt = ns_dt + timedelta(minutes=5)
-    nws, nwe = ns_dt.strftime("%H:%M"), ne_dt.strftime("%H:%M")
-
-    rec = {
-        "window_start": nws, "window_end": nwe, "window": f"{nws}-{nwe}",
-        "predicted": pred["signal"], "confidence": pred["confidence"],
-        "act_open": 0.0, "act_close": 0.0, "actual": "⏳", "result": "⏳",
-    }
-    history_rows.insert(0, rec)
-    save_prediction(rec)
-    while len(history_rows) > 5:
-        history_rows.pop()
+    else:
+        logger.error(f"No pending row found for window {ws_str}-{we_str}")
 
     if candles_since_retrain >= RETRAIN_EVERY:
         candles_since_retrain = 0
@@ -1084,7 +905,6 @@ def _close_current_window_locked() -> None:
             target=train_model_from_candles,
             args=(list(completed_candles),), daemon=True,
         ).start()
-
 
 # ============================================================
 # COINBASE WEBSOCKET
@@ -1100,7 +920,6 @@ def _coinbase_thread() -> None:
                                    "product_ids": ["BTC-USD"],
                                    "channels": ["ticker", "matches"]}))
                 logger.info("Coinbase WS connected")
-
             def on_message(w, raw):
                 try:
                     d = json.loads(raw)
@@ -1110,7 +929,6 @@ def _coinbase_thread() -> None:
                             price_queue.put_nowait({"price": price, "ts": time.time()})
                 except Exception:
                     pass
-
             ws_client.WebSocketApp(
                 url, on_open=on_open, on_message=on_message,
                 on_error=lambda w, e: logger.error(f"WS err: {e}"),
@@ -1121,7 +939,6 @@ def _coinbase_thread() -> None:
         logger.warning(f"Reconnecting in {retry}s …")
         time.sleep(retry)
         retry = min(retry * 2, 60)
-
 
 # ============================================================
 # PRICE PROCESSOR
@@ -1136,7 +953,6 @@ def price_processor_thread() -> None:
         except Exception as e:
             logger.error(f"Price processor: {e}")
 
-
 # ============================================================
 # BROADCAST
 # ============================================================
@@ -1145,9 +961,8 @@ async def _periodic_broadcast() -> None:
         await asyncio.sleep(1)
         await _broadcast_state()
 
-
 async def _broadcast_state() -> None:
-    msg  = json.dumps(_build_state_payload())
+    msg = json.dumps(_build_state_payload())
     async with _clients_lock:
         snap = list(_clients)
     dead = []
@@ -1162,22 +977,17 @@ async def _broadcast_state() -> None:
                 if ws in _clients:
                     _clients.remove(ws)
 
-
 def _build_state_payload() -> dict:
     with state_lock:
         snap = list(completed_candles)
         lc   = dict(live_candle) if live_candle else None
         w, l = wins, losses
         rows = list(history_rows[:5])
-
-    pred       = predict_from_candles(snap) if snap else \
-                 {"signal": "HOLD", "confidence": 0, "next_window": ""}
-    ohlc       = ({k: round(lc[k], 2) for k in ("open","high","low","close")} if lc else {})
+    pred = predict_from_candles(snap) if snap else {"signal": "HOLD", "confidence": 0, "next_window": ""}
+    ohlc = ({k: round(lc[k], 2) for k in ("open","high","low","close")} if lc else {})
     live_price = lc["close"] if lc else (snap[-1]["close"] if snap else 0.0)
-
     with model_lock:
         model_ready = model is not None
-
     return {
         "price": round(live_price, 2),
         "signal": pred["signal"],
@@ -1188,9 +998,8 @@ def _build_state_payload() -> dict:
         "model_ready": model_ready,
     }
 
-
 # ============================================================
-# HTML FRONTEND
+# HTML FRONTEND – UNCHANGED (same as your original)
 # ============================================================
 HTML_CONTENT = """<!DOCTYPE html>
 <html lang="en">
@@ -1434,7 +1243,6 @@ HTML_CONTENT = """<!DOCTYPE html>
   function handleState(d){
     if(d.type==='ping')return;
 
-    // ── Price ──────────────────────────────────────────────────
     const p=d.price;
     if(p&&p>0){
       const priceEl=document.getElementById('price-val');
@@ -1451,7 +1259,6 @@ HTML_CONTENT = """<!DOCTYPE html>
       chgEl.style.color=chg>=0?'#00E5A0':'#FF4560';
     }
 
-    // ── Prediction ────────────────────────────────────────────
     const sig=d.signal||'HOLD';
     const isUp=sig==='UP', isDn=sig==='DOWN', isHold=sig==='HOLD';
     const col=isUp?'#00E5A0':isDn?'#FF4560':'#4A6080';
@@ -1461,7 +1268,6 @@ HTML_CONTENT = """<!DOCTYPE html>
     document.getElementById('pred-dir').textContent    = isUp?'UP':isDn?'DOWN':'HOLD';
     document.getElementById('pred-dir').style.color    = col;
 
-    // Confidence: show "--" for HOLD, "%"" for UP/DOWN
     const confEl=document.getElementById('conf-pct');
     if(isHold){
       confEl.textContent='--'; confEl.style.color='#4A6080';
@@ -1469,12 +1275,10 @@ HTML_CONTENT = """<!DOCTYPE html>
       confEl.textContent=d.confidence+'%'; confEl.style.color=col;
     }
 
-    // Confidence bar: empty for HOLD
     document.getElementById('conf-bar').style.width     = isHold?'0%':(d.confidence||0)+'%';
     document.getElementById('conf-bar').style.background= col;
     document.getElementById('pred-window').textContent  = d.next_window?'Next: '+d.next_window:'';
 
-    // ── OHLC ──────────────────────────────────────────────────
     if(d.ohlc){
       document.getElementById('o-open').textContent  = fmt(d.ohlc.open);
       document.getElementById('o-high').textContent  = fmt(d.ohlc.high);
@@ -1482,13 +1286,11 @@ HTML_CONTENT = """<!DOCTYPE html>
       document.getElementById('o-close').textContent = fmt(d.ohlc.close);
     }
 
-    // ── Performance: only UP/DOWN count ──────────────────────
     const w=d.wins||0, l=d.losses||0, tot=w+l;
     document.getElementById('p-wins').textContent   = w;
     document.getElementById('p-losses').textContent = l;
     document.getElementById('p-acc').textContent    = tot?(w/tot*100).toFixed(1)+'%':'--';
 
-    // ── History table ─────────────────────────────────────────
     const tbody=document.getElementById('history-body');
     if(d.table&&d.table.length){
       tbody.innerHTML=d.table.map(function(r){
@@ -1497,10 +1299,8 @@ HTML_CONTENT = """<!DOCTYPE html>
         const actCls  = r.actual==='UP'   ?'up':r.actual==='DOWN'    ?'down':'';
         const predTxt = r.predicted==='UP'?'▲ UP':r.predicted==='DOWN'?'▼ DOWN':'◆ HOLD';
         const actTxt  = r.actual==='⏳'  ?'--'  :r.actual==='UP'?'▲ UP':r.actual==='DOWN'?'▼ DOWN':r.actual;
-        // Confidence cell: "--" for HOLD
         const confTxt = isHoldPred ? '--' : r.confidence+'%';
         const confCol = isHoldPred ? '#4A6080' : '#F7931A';
-        // Result cell: "—" means HOLD (skipped), not a win/loss
         const resTxt  = r.result==='⏳'?'⏳':r.result==='—'?'—':r.result;
         return '<tr>'
           +'<td style="color:#4A6080">'+r.window+'</td>'
@@ -1522,13 +1322,12 @@ HTML_CONTENT = """<!DOCTYPE html>
 </body>
 </html>"""
 
-
 # ============================================================
 # FASTAPI APPLICATION
 # ============================================================
 @asynccontextmanager
 async def lifespan(application: FastAPI):
-    global _main_loop, _clients_lock, model, wins, losses, completed_candles, history_rows
+    global _main_loop, _clients_lock, model, wins, losses, completed_candles, history_rows, live_candle, live_window_start
 
     _main_loop    = asyncio.get_running_loop()
     _clients_lock = asyncio.Lock()
@@ -1575,6 +1374,17 @@ async def lifespan(application: FastAPI):
     else:
         logger.info(f"Continuing with existing ensemble ({len(completed_candles)} candles loaded)")
 
+    # Seed a pending row for the current time window (so UI never shows empty table)
+    current_ts = time.time()
+    current_ws = int(current_ts // WINDOW_SECONDS) * WINDOW_SECONDS
+    with state_lock:
+        ws_str, _ = get_window_time_range(current_ws)
+        exists = any(row.get("window_start") == ws_str for row in history_rows)
+        if not exists and len(completed_candles) > 0:
+            last_price = completed_candles[-1]["close"]
+            _seed_pending_row_locked(current_ws, last_price)
+            logger.info(f"Seeded initial pending row for current window {ws_str}")
+
     save_stats(wins, losses)
 
     threading.Thread(target=price_processor_thread, name="price-proc", daemon=True).start()
@@ -1584,7 +1394,7 @@ async def lifespan(application: FastAPI):
 
     lgb_status = "LightGBM" if HAS_LGB else "LightGBM (missing)"
     logger.info("=" * 60)
-    logger.info("BTC Adaptive Predictor v3.0 — ready")
+    logger.info("BTC Adaptive Predictor v3.0 — ready (window seeding + matching fixed)")
     logger.info(f"Models   : BiLSTM + AttentionGRU + XGBoost + RandomForest + {lgb_status}")
     logger.info(f"Features : {N_FEATURES}  |  Seq len : {SEQ_LEN}  |  History : {HISTORY_LIMIT}")
     logger.info(f"Thresholds: UP ≥ {SIGNAL_UP_THRESH}  DOWN ≤ {SIGNAL_DOWN_THRESH}")
@@ -1600,14 +1410,11 @@ async def lifespan(application: FastAPI):
     save_stats(wins, losses)
     logger.info(f"Shutdown — state saved ({wins}W / {losses}L)")
 
-
 app = FastAPI(lifespan=lifespan)
-
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return HTML_CONTENT
-
 
 @app.websocket("/ws")
 async def ws_endpoint(websocket: WebSocket):
@@ -1641,9 +1448,7 @@ async def ws_endpoint(websocket: WebSocket):
                 _clients.remove(websocket)
         logger.info(f"WS client disconnected — total: {len(_clients)}")
 
-
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port,
-                ws="websockets", log_level="info")
+    uvicorn.run("main:app", host="0.0.0.0", port=port, ws="websockets", log_level="info")
