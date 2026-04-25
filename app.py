@@ -1,11 +1,10 @@
 """
-Bitcoin 5-Minute Prediction Terminal - RENDER READY
-====================================================
+Bitcoin 5-Minute Prediction Terminal
+=====================================
 - TradingView chart (BITSTAMP:BTCUSD) + Binance WebSocket for live prices
 - XGBoost model, 5-min candles, win/loss tracking
 - GMT+3 timezone, prices with 2 decimal places
-- Correct port binding for Render ($PORT)
-- WebSocket keepalive to prevent Render proxy timeout
+- Render-compatible: plain daemon threads, no anyio, correct $PORT binding
 """
 
 import asyncio
@@ -31,28 +30,24 @@ from fastapi.responses import HTMLResponse
 # ============================================================
 # LOGGING
 # ============================================================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 # ============================================================
 # CONSTANTS
 # ============================================================
-WINDOW_SECONDS     = 300
-HISTORY_LIMIT      = 100
-MIN_CANDLES_TRAIN  = 12
-RETRAIN_EVERY      = 5
-TZ                 = timezone(timedelta(hours=3))   # GMT+3
-TV_CHART_SYMBOL    = "BITSTAMP:BTCUSD"
+WINDOW_SECONDS    = 300
+HISTORY_LIMIT     = 100
+MIN_CANDLES_TRAIN = 12
+RETRAIN_EVERY     = 5
+TZ                = timezone(timedelta(hours=3))  # GMT+3
 
 # ============================================================
-# SHARED STATE
+# SHARED STATE  (all mutation under state_lock)
 # ============================================================
 state_lock             = threading.Lock()
-completed_candles:     Deque[dict]   = deque(maxlen=HISTORY_LIMIT)
-history_rows:          List[dict]    = []
+completed_candles:     Deque[dict]    = deque(maxlen=HISTORY_LIMIT)
+history_rows:          List[dict]     = []
 live_candle:           Optional[dict] = None
 live_window_start:     Optional[float] = None
 wins:                  int = 0
@@ -64,12 +59,12 @@ model_lock = threading.Lock()
 
 price_queue: Queue = Queue()
 
-_clients:      List[WebSocket]                     = []
-_clients_lock: Optional[asyncio.Lock]              = None
+_clients:      List[WebSocket]                    = []
+_clients_lock: Optional[asyncio.Lock]             = None
 _main_loop:    Optional[asyncio.AbstractEventLoop] = None
 
 # ============================================================
-# SYNTHETIC HISTORY
+# SYNTHETIC HISTORY  (warm-start model before live data)
 # ============================================================
 def generate_synthetic_history(n: int = 60) -> List[dict]:
     candles, price = [], 65_000.0
@@ -109,8 +104,7 @@ def make_features(candles: List[dict]) -> Optional[pd.DataFrame]:
     df["ret_lag2"]  = df["ret"].shift(2)
     df["momentum"]  = df["close"] - df["close"].shift(3)
     df.dropna(inplace=True)
-    cols = ["ret", "hl", "oc", "ma_diff", "vol_ratio",
-            "ret_lag1", "ret_lag2", "momentum"]
+    cols = ["ret", "hl", "oc", "ma_diff", "vol_ratio", "ret_lag1", "ret_lag2", "momentum"]
     return df[cols] if len(df) >= 1 else None
 
 # ============================================================
@@ -124,10 +118,8 @@ def train_model_from_candles(candles: List[dict]) -> None:
         features_df = make_features(candles[:-1])
         if features_df is None or len(features_df) == 0:
             return
-
         n      = len(features_df)
         offset = (len(candles) - 1) - n
-
         labels = []
         for i in range(n):
             nxt_idx = offset + i + 1
@@ -135,18 +127,14 @@ def train_model_from_candles(candles: List[dict]) -> None:
                 break
             nxt = candles[nxt_idx]
             labels.append(1 if nxt["close"] >= nxt["open"] else 0)
-
         if len(labels) < MIN_CANDLES_TRAIN:
             return
-
         features_df = features_df.iloc[:len(labels)]
-
         clf = xgb.XGBClassifier(
             n_estimators=60, max_depth=3,
             learning_rate=0.1, eval_metric="logloss", verbosity=0,
         )
         clf.fit(features_df.values, labels)
-
         with model_lock:
             model = clf
         logger.info(f"Model trained on {len(labels)} samples")
@@ -166,15 +154,12 @@ def predict_from_candles(candles: List[dict]) -> dict:
         features_df = make_features(candles)
         if features_df is None or len(features_df) == 0:
             return default
-
         prob = mdl.predict_proba(features_df.iloc[[-1]].values)[0]
         up_p = float(prob[1])
         conf = int(round(max(up_p, 1 - up_p) * 100))
-
         if   up_p > 0.55: signal = "UP"
         elif up_p < 0.45: signal = "DOWN"
         else:             signal = "HOLD"
-
         now      = datetime.now(TZ)
         next_min = ((now.minute // 5) + 1) * 5
         delta    = timedelta(
@@ -183,7 +168,6 @@ def predict_from_candles(candles: List[dict]) -> dict:
             microseconds = -now.microsecond,
         )
         nxt_time = (now + delta).strftime("%H:%M")
-
         return {"signal": signal, "confidence": conf, "next_window": nxt_time}
     except Exception as exc:
         logger.error(f"Prediction error: {exc}")
@@ -194,11 +178,9 @@ def predict_from_candles(candles: List[dict]) -> dict:
 # ============================================================
 def process_price_tick(price: float, trade_ts: float) -> None:
     global live_candle, live_window_start, candles_since_retrain, wins, losses
-
     with state_lock:
         if live_window_start is None:
             live_window_start = trade_ts - (trade_ts % WINDOW_SECONDS)
-
         if trade_ts >= live_window_start + WINDOW_SECONDS:
             if live_candle is not None:
                 _close_current_window_locked()
@@ -212,89 +194,88 @@ def process_price_tick(price: float, trade_ts: float) -> None:
             live_candle["close"] = price
 
 def _new_candle(ts: float, price: float) -> dict:
-    return {"ts": ts, "open": price, "high": price,
-            "low": price, "close": price, "volume": 0.0}
+    return {"ts": ts, "open": price, "high": price, "low": price, "close": price, "volume": 0.0}
 
 def _close_current_window_locked() -> None:
     global live_candle, candles_since_retrain, wins, losses
-
     candle       = dict(live_candle)
     live_candle  = None
     completed_candles.append(candle)
     candles_since_retrain += 1
 
     for row in reversed(history_rows):
-        if row.get("actual") == "⏳":
+        if row.get("actual") == "\u23f3":
             actual           = "UP" if candle["close"] > candle["open"] else "DOWN"
             row["actual"]    = actual
             row["act_open"]  = candle["open"]
             row["act_close"] = candle["close"]
             if row["predicted"] == actual:
-                row["result"] = "✅"; wins   += 1
+                row["result"] = "\u2705"; wins   += 1
             else:
-                row["result"] = "❌"; losses += 1
+                row["result"] = "\u274c"; losses += 1
             break
 
     snap = list(completed_candles)
     pred = predict_from_candles(snap)
     dt   = datetime.fromtimestamp(candle["ts"], tz=TZ).strftime("%H:%M")
-
     history_rows.append({
         "window":     dt,
         "predicted":  pred["signal"],
         "confidence": pred["confidence"],
         "act_open":   0.0,
         "act_close":  0.0,
-        "actual":     "⏳",
-        "result":     "⏳",
+        "actual":     "\u23f3",
+        "result":     "\u23f3",
     })
     del history_rows[:-HISTORY_LIMIT]
 
     if candles_since_retrain >= RETRAIN_EVERY:
         candles_since_retrain = 0
         threading.Thread(
-            target=train_model_from_candles,
-            args=(snap,), daemon=True,
+            target=train_model_from_candles, args=(snap,), daemon=True
         ).start()
 
 # ============================================================
-# BINANCE WEBSOCKET — runs in a dedicated daemon thread
+# BINANCE WEBSOCKET — plain daemon thread, NO anyio
 # ============================================================
 def _binance_thread() -> None:
-    """Dedicated thread: connects to Binance, auto-reconnects on failure."""
-    url = "wss://stream.binance.com:9443/ws/btcusdt@trade"
+    url         = "wss://stream.binance.com:9443/ws/btcusdt@trade"
     retry_delay = 2
-
     while True:
         logger.info("Connecting to Binance WebSocket...")
         try:
+            def on_open(ws_obj):
+                nonlocal retry_delay
+                retry_delay = 2
+                logger.info("Binance WS connected")
+
             def on_message(ws_obj, raw):
                 try:
                     data = json.loads(raw)
                     if data.get("e") == "trade":
-                        price = float(data["p"])
-                        ts    = float(data["T"]) / 1000.0
-                        price_queue.put_nowait({"price": price, "ts": ts})
+                        price_queue.put_nowait({
+                            "price": float(data["p"]),
+                            "ts":    float(data["T"]) / 1000.0,
+                        })
                 except Exception:
                     pass
 
             def on_error(ws_obj, err):
                 logger.error(f"Binance WS error: {err}")
 
-            def on_open(ws_obj):
-                nonlocal retry_delay
-                retry_delay = 2
-                logger.info("Binance WS connected")
+            def on_close(ws_obj, code, msg):
+                logger.warning("Binance WS closed")
 
             app_ws = ws_client.WebSocketApp(
                 url,
+                on_open=on_open,
                 on_message=on_message,
                 on_error=on_error,
-                on_open=on_open,
+                on_close=on_close,
             )
             app_ws.run_forever(ping_interval=20, ping_timeout=10)
         except Exception as exc:
-            logger.error(f"Binance thread error: {exc}")
+            logger.error(f"Binance thread exception: {exc}")
 
         logger.warning(f"Binance WS reconnecting in {retry_delay}s...")
         time.sleep(retry_delay)
@@ -314,7 +295,7 @@ def price_processor_thread() -> None:
             logger.error(f"Price processor error: {exc}")
 
 # ============================================================
-# WEBSOCKET BROADCAST
+# BROADCAST
 # ============================================================
 async def _periodic_broadcast() -> None:
     while True:
@@ -322,9 +303,9 @@ async def _periodic_broadcast() -> None:
         await _broadcast_state()
 
 async def _broadcast_state() -> None:
-    payload = _build_state_payload()
-    msg     = json.dumps(payload)
-    # Snapshot clients first — never hold the lock during async sends
+    payload  = _build_state_payload()
+    msg      = json.dumps(payload)
+    # Snapshot clients before releasing lock — never hold lock during async sends
     async with _clients_lock:
         snapshot = list(_clients)
     dead = []
@@ -348,8 +329,7 @@ def _build_state_payload() -> dict:
 
     pred       = predict_from_candles(snap) if snap else \
                  {"signal": "HOLD", "confidence": 0, "next_window": ""}
-    ohlc       = ({k: round(lc[k], 2) for k in ("open", "high", "low", "close")}
-                  if lc else {})
+    ohlc       = ({k: round(lc[k], 2) for k in ("open", "high", "low", "close")} if lc else {})
     live_price = lc["close"] if lc else (snap[-1]["close"] if snap else 0.0)
 
     with model_lock:
@@ -368,7 +348,7 @@ def _build_state_payload() -> dict:
     }
 
 # ============================================================
-# HTML FRONTEND
+# HTML FRONTEND  (original sidebar design)
 # ============================================================
 HTML_CONTENT = """<!DOCTYPE html>
 <html lang="en">
@@ -378,82 +358,103 @@ HTML_CONTENT = """<!DOCTYPE html>
 <title>BTC 5-Min Predictor</title>
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
-  body{background:#080C14;color:#E0E6F0;font-family:'Segoe UI',sans-serif;min-height:100vh}
-  .container{max-width:1200px;margin:0 auto;padding:16px}
-  .header{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
-  .logo{font-size:1.3rem;font-weight:700;color:#F7931A}
-  .status{display:flex;align-items:center;gap:8px;font-size:.85rem}
-  .dot{width:8px;height:8px;border-radius:50%;display:inline-block}
-  .dot-ok{background:#00E5A0;box-shadow:0 0 6px #00E5A0}
-  .dot-bad{background:#FF4560}
-  .clock{color:#4A6080;font-size:.85rem}
-  .grid-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:12px}
-  .grid-2{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}
-  .card{background:#0D1421;border:1px solid #1A2540;border-radius:10px;padding:16px}
-  .card-title{font-size:.75rem;color:#4A6080;text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px}
-  #tv-widget{height:320px;border-radius:8px;overflow:hidden;margin-bottom:12px;border:1px solid #1A2540}
-  .price-big{font-size:2.2rem;font-weight:700;color:#F7931A;letter-spacing:.02em}
-  .price-change{font-size:.85rem;margin-top:4px}
-  .pred-box{text-align:center}
-  .pred-arrow{font-size:3rem;line-height:1}
-  .pred-dir{font-size:1.4rem;font-weight:700;margin-top:4px}
-  .conf-label{font-size:.75rem;color:#4A6080;margin-top:8px}
-  .conf-bar-bg{background:#1A2540;border-radius:4px;height:6px;margin-top:6px}
-  .conf-bar{height:6px;border-radius:4px;transition:width .5s}
-  .pred-window{font-size:.8rem;color:#4A6080;margin-top:6px}
-  .ohlc-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
-  .ohlc-cell{background:#080C14;border-radius:6px;padding:8px;text-align:center}
-  .lbl{font-size:.7rem;color:#4A6080;margin-bottom:4px}
-  .up{color:#00E5A0}.down{color:#FF4560}
-  .perf-row{display:flex;justify-content:space-around;text-align:center}
-  .perf-num{font-size:1.6rem;font-weight:700}
-  .perf-lbl{font-size:.75rem;color:#4A6080;margin-top:4px}
-  .table-wrapper{overflow-x:auto}
-  table{width:100%;border-collapse:collapse;font-size:.82rem}
-  th{color:#4A6080;font-weight:500;text-align:left;padding:6px 8px;border-bottom:1px solid #1A2540}
-  td{padding:6px 8px;border-bottom:1px solid #0D1421}
-  .disclaimer{text-align:center;color:#4A6080;font-size:.75rem;margin-top:12px;padding:8px}
+  body{background:#080C14;color:#C8D8EF;font-family:'Segoe UI',sans-serif;min-height:100vh;}
+  .container{max-width:1280px;margin:0 auto;padding:14px;}
+  .header{margin-bottom:10px;}
+  .header h1{font-size:1.2rem;font-weight:700;color:#F7931A;letter-spacing:.04em;}
+  .status-bar{display:flex;align-items:center;gap:10px;margin-bottom:12px;font-size:.8rem;color:#4A6080;}
+  .dot{width:8px;height:8px;border-radius:50%;display:inline-block;flex-shrink:0;}
+  .dot-ok{background:#00E5A0;box-shadow:0 0 6px #00E5A0;}
+  .dot-bad{background:#FF4560;}
+  .dot-wait{background:#F7931A;animation:pulse 1.2s infinite;}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+  .main-grid{display:grid;grid-template-columns:1fr 340px;gap:14px;margin-bottom:14px;}
+  @media(max-width:900px){.main-grid{grid-template-columns:1fr;}}
+  #tv-chart{background:#0D1421;border-radius:10px;border:1px solid #1E2D45;height:380px;overflow:hidden;}
+  .sidebar{display:flex;flex-direction:column;gap:12px;}
+  .card{background:#0D1421;border:1px solid #1E2D45;border-radius:10px;padding:14px;}
+  .card-title{font-size:.68rem;color:#4A6080;text-transform:uppercase;letter-spacing:.1em;margin-bottom:8px;}
+  .price{font-size:2rem;font-weight:700;color:#F7931A;}
+  .pchange{font-size:.82rem;margin-left:6px;}
+  .pred-row{display:flex;align-items:center;gap:12px;margin-top:4px;}
+  .pred-arrow{font-size:2.4rem;line-height:1;}
+  .pred-dir{font-size:1.3rem;font-weight:700;}
+  .conf-bar{background:#1E2D45;border-radius:4px;height:6px;margin-top:8px;overflow:hidden;}
+  .conf-fill{height:100%;width:0%;transition:width 0.4s ease;}
+  .countdown{display:flex;align-items:center;gap:14px;}
+  .cd-ring{width:58px;height:58px;transform:rotate(-90deg);}
+  .cd-text{font-size:1.8rem;font-weight:700;color:#F7931A;}
+  .bottom-row{display:grid;gap:14px;grid-template-columns:1fr 1fr;margin-bottom:14px;}
+  @media(max-width:600px){.bottom-row{grid-template-columns:1fr;}}
+  .ohlc-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:6px;}
+  .ohlc-cell{background:#0F1623;border-radius:6px;padding:7px 10px;border:1px solid #1E2D45;}
+  .ohlc-cell .lbl{font-size:.6rem;color:#4A6080;}
+  .ohlc-cell .val{font-size:.88rem;font-weight:700;margin-top:2px;}
+  .perf-row{display:flex;gap:10px;margin-top:8px;}
+  .perf-stat{flex:1;text-align:center;background:#0F1623;border-radius:7px;padding:8px;border:1px solid #1E2D45;}
+  .perf-num{font-size:1.35rem;font-weight:700;}
+  .perf-lbl{font-size:.6rem;color:#4A6080;margin-top:2px;}
+  .table-wrapper{overflow-x:auto;margin-top:10px;}
+  table{width:100%;border-collapse:collapse;font-size:.75rem;}
+  th,td{padding:8px;text-align:left;border-bottom:1px solid #1E2D45;}
+  th{color:#4A6080;font-weight:600;}
+  .up{color:#00E5A0;}.down{color:#FF4560;}
+  .disclaimer{background:#0F1623;border-radius:8px;padding:10px;font-size:.7rem;text-align:center;color:#FACC15;border:1px solid rgba(250,204,21,.13);margin-top:14px;}
+  .flash-up{animation:flashUp .4s ease;}.flash-dn{animation:flashDn .4s ease;}
+  @keyframes flashUp{0%,100%{color:#C8D8EF}50%{color:#00E5A0}}
+  @keyframes flashDn{0%,100%{color:#C8D8EF}50%{color:#FF4560}}
 </style>
 </head>
 <body>
 <div class="container">
-  <div class="header">
-    <div class="logo">₿ BTC Predictor</div>
-    <div class="status">
-      <span class="dot dot-bad" id="ws-dot"></span>
-      <span id="ws-txt">Connecting...</span>
-    </div>
-    <div class="clock" id="clock">--:--:--</div>
+  <div class="header"><h1>&#x20BF; Bitcoin Price Trend Predictor</h1></div>
+  <div class="status-bar">
+    <div class="dot dot-wait" id="ws-dot"></div>
+    <span id="ws-txt">Connecting...</span>
+    <span id="clock-gmt3">--:--:-- GMT+3</span>
   </div>
 
-  <div id="tv-widget"></div>
-
-  <div class="grid-3">
-    <div class="card">
-      <div class="card-title">Live Price</div>
-      <div class="price-big" id="live-price">$--</div>
-      <div class="price-change" id="price-change"></div>
-    </div>
-    <div class="card pred-box">
-      <div class="card-title">Next 5-Min Signal</div>
-      <div class="pred-arrow" id="pred-arrow">◆</div>
-      <div class="pred-dir" id="pred-dir" style="color:#4A6080">HOLD</div>
-      <div class="conf-label">Confidence: <span id="conf-pct">--%</span></div>
-      <div class="conf-bar-bg"><div class="conf-bar" id="conf-bar" style="width:0%"></div></div>
-      <div class="pred-window" id="pred-window"></div>
-    </div>
-    <div class="card">
-      <div class="card-title">Current Window</div>
-      <div class="ohlc-grid">
-        <div class="ohlc-cell"><div class="lbl">Open</div><div id="o-open">--</div></div>
-        <div class="ohlc-cell"><div class="lbl">High</div><div id="o-high" class="up">--</div></div>
-        <div class="ohlc-cell"><div class="lbl">Low</div><div id="o-low" class="down">--</div></div>
-        <div class="ohlc-cell"><div class="lbl">Close</div><div id="o-close">--</div></div>
+  <div class="main-grid">
+    <div id="tv-chart"><div id="tv-widget" style="width:100%;height:100%"></div></div>
+    <div class="sidebar">
+      <div class="card">
+        <div class="card-title">Live BTC / USD</div>
+        <div><span class="price" id="price-val">$---.--</span><span class="pchange" id="price-change">--</span></div>
+      </div>
+      <div class="card">
+        <div class="card-title">Next 5-Min Prediction</div>
+        <div class="pred-row">
+          <span class="pred-arrow" id="pred-arrow" style="color:#4A6080">&#x25C6;</span>
+          <span class="pred-dir" id="pred-dir" style="color:#4A6080">HOLD</span>
+          <span id="conf-pct" style="font-size:.85rem;color:#4A6080">--%</span>
+        </div>
+        <div class="conf-bar"><div class="conf-fill" id="conf-bar"></div></div>
+        <div id="pred-window" style="margin-top:6px;font-size:.7rem;color:#4A6080;"></div>
+      </div>
+      <div class="card">
+        <div class="card-title">Next window opens in</div>
+        <div class="countdown">
+          <svg class="cd-ring" viewBox="0 0 72 72">
+            <circle cx="36" cy="36" r="32" stroke="#1E2D45" stroke-width="5" fill="none"/>
+            <circle cx="36" cy="36" r="32" stroke="#F7931A" stroke-width="5" fill="none"
+              stroke-dasharray="201" stroke-dashoffset="201" id="cd-ring" stroke-linecap="round"/>
+          </svg>
+          <div class="cd-text" id="cd-val">5:00</div>
+        </div>
       </div>
     </div>
   </div>
 
-  <div class="grid-2">
+  <div class="bottom-row">
+    <div class="card">
+      <div class="card-title">Current Window</div>
+      <div class="ohlc-grid">
+        <div class="ohlc-cell"><div class="lbl">Open</div><div class="val" id="o-open">--</div></div>
+        <div class="ohlc-cell"><div class="lbl">High</div><div class="val up" id="o-high">--</div></div>
+        <div class="ohlc-cell"><div class="lbl">Low</div><div class="val down" id="o-low">--</div></div>
+        <div class="ohlc-cell"><div class="lbl">Close</div><div class="val" id="o-close">--</div></div>
+      </div>
+    </div>
     <div class="card">
       <div class="card-title">Performance</div>
       <div class="perf-row">
@@ -462,145 +463,141 @@ HTML_CONTENT = """<!DOCTYPE html>
         <div class="perf-stat"><div class="perf-num" id="p-acc" style="color:#F7931A">--%</div><div class="perf-lbl">Accuracy</div></div>
       </div>
     </div>
-    <div class="card">
-      <div class="card-title">Model Status</div>
-      <div id="model-status" style="color:#F7931A;font-size:.85rem">⏳ Collecting data...</div>
-    </div>
   </div>
 
   <div class="card">
     <div class="card-title">Prediction History (last 5)</div>
     <div class="table-wrapper">
       <table>
-        <thead>
-          <tr><th>Window</th><th>Prediction</th><th>Conf</th><th>Act.Open</th><th>Act.Close</th><th>Actual</th><th>Result</th></tr>
-        </thead>
-        <tbody id="history-body">
-          <tr><td colspan="7" style="text-align:center;padding:20px;">Waiting for data...</td></tr>
-        </tbody>
+        <thead><tr><th>Window</th><th>Prediction</th><th>Conf</th><th>Act.Open</th><th>Act.Close</th><th>Actual</th><th>Result</th></tr></thead>
+        <tbody id="history-body"><tr><td colspan="7" style="text-align:center;padding:20px;">Waiting for data...</td></tr></tbody>
       </table>
     </div>
   </div>
 
-  <div class="disclaimer">⚠️ For educational purposes only. Past accuracy does not guarantee future results.</div>
+  <div class="disclaimer">&#x26A0;&#xFE0F; For educational purposes only. Past accuracy does not guarantee future results.</div>
 </div>
 
 <script src="https://s3.tradingview.com/tv.js"></script>
 <script>
   new TradingView.widget({
-    container_id:'tv-widget',
-    symbol:'BITSTAMP:BTCUSD',
-    interval:'5',
-    theme:'dark',
-    style:'1',
-    locale:'en',
-    toolbar_bg:'#080C14',
-    enable_publishing:false,
-    autosize:true
+    container_id:'tv-widget',symbol:'BITSTAMP:BTCUSD',interval:'5',
+    theme:'dark',style:'1',locale:'en',toolbar_bg:'#080C14',
+    enable_publishing:false,autosize:true
   });
 
-  let ws, firstPrice = null;
+  let ws, firstPrice=null, prevPrice=null;
 
-  function updateClock() {
-    let d = new Date();
-    document.getElementById('clock').textContent =
-      d.toLocaleTimeString('en-US', {timeZone:'Africa/Nairobi', hour12:false});
+  function updateClock(){
+    const d=new Date();
+    document.getElementById('clock-gmt3').textContent=
+      d.toLocaleTimeString('en-US',{timeZone:'Africa/Nairobi',hour12:false})+' GMT+3';
   }
-  updateClock();
-  setInterval(updateClock, 1000);
+  updateClock(); setInterval(updateClock,1000);
 
-  function fmt(n) {
-    if (n == null || n === 0) return '--';
-    return '$' + Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2});
+  function updateCountdown(){
+    const now=new Date();
+    const gmt3=new Date(now.getTime()+3*3600000);
+    const sec=gmt3.getUTCSeconds()+gmt3.getUTCMinutes()%5*60;
+    const remaining=300-sec%300;
+    const mm=Math.floor(remaining/60);
+    const ss=String(remaining%60).padStart(2,'0');
+    document.getElementById('cd-val').textContent=mm+':'+ss;
+    const circ=201;
+    document.getElementById('cd-ring').setAttribute('stroke-dashoffset',
+      String(circ*(1-(remaining/300))));
   }
+  updateCountdown(); setInterval(updateCountdown,1000);
 
-  function connect() {
-    const wsUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws';
-    ws = new WebSocket(wsUrl);
-    ws.onopen = function() {
-      document.getElementById('ws-dot').className = 'dot dot-ok';
-      document.getElementById('ws-txt').textContent = 'Live';
-    };
-    ws.onclose = function() {
-      document.getElementById('ws-dot').className = 'dot dot-bad';
-      document.getElementById('ws-txt').textContent = 'Disconnected';
-      setTimeout(connect, 3000);
-    };
-    ws.onerror = function() {
-      document.getElementById('ws-dot').className = 'dot dot-bad';
-    };
-    ws.onmessage = function(e) {
-      try { handleState(JSON.parse(e.data)); } catch(err) {}
-    };
+  function fmt(n){
+    if(n==null||n===0)return'--';
+    return'$'+Number(n).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
   }
 
-  function handleState(d) {
-    if (d.type === 'ping') return;
+  function connect(){
+    const wsUrl=(location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws';
+    ws=new WebSocket(wsUrl);
+    ws.onopen=function(){
+      document.getElementById('ws-dot').className='dot dot-ok';
+      document.getElementById('ws-txt').textContent='Live';
+    };
+    ws.onclose=function(){
+      document.getElementById('ws-dot').className='dot dot-bad';
+      document.getElementById('ws-txt').textContent='Disconnected';
+      setTimeout(connect,3000);
+    };
+    ws.onerror=function(){
+      document.getElementById('ws-dot').className='dot dot-bad';
+    };
+    ws.onmessage=function(e){
+      try{handleState(JSON.parse(e.data));}catch(err){}
+    };
+  }
 
-    let p = d.price;
-    if (p && p > 0) {
-      document.getElementById('live-price').textContent = fmt(p);
-      if (firstPrice === null) firstPrice = p;
-      let chg = p - firstPrice;
-      let pct = (chg / firstPrice * 100).toFixed(2);
-      let chgEl = document.getElementById('price-change');
-      chgEl.textContent = (chg >= 0 ? '+' : '') + fmt(chg) + ' (' + pct + '%)';
-      chgEl.style.color = chg >= 0 ? '#00E5A0' : '#FF4560';
+  function handleState(d){
+    if(d.type==='ping')return;
+
+    const p=d.price;
+    if(p&&p>0){
+      const priceEl=document.getElementById('price-val');
+      if(prevPrice!==null){
+        priceEl.className='price '+(p>prevPrice?'flash-up':p<prevPrice?'flash-dn':'');
+        setTimeout(function(){priceEl.className='price';},400);
+      }
+      priceEl.textContent=fmt(p);
+      prevPrice=p;
+      if(firstPrice===null)firstPrice=p;
+      const chg=p-firstPrice;
+      const pct=(chg/firstPrice*100).toFixed(2);
+      const chgEl=document.getElementById('price-change');
+      chgEl.textContent=(chg>=0?'+':'')+fmt(chg)+' ('+pct+'%)';
+      chgEl.style.color=chg>=0?'#00E5A0':'#FF4560';
     }
 
-    let sig = d.signal || 'HOLD';
-    let isUp = sig === 'UP', isDn = sig === 'DOWN';
-    let col = isUp ? '#00E5A0' : isDn ? '#FF4560' : '#4A6080';
-    document.getElementById('pred-arrow').textContent = isUp ? '▲' : isDn ? '▼' : '◆';
-    document.getElementById('pred-arrow').style.color = col;
-    document.getElementById('pred-dir').textContent = isUp ? 'UP' : isDn ? 'DOWN' : 'HOLD';
-    document.getElementById('pred-dir').style.color = col;
-    document.getElementById('conf-pct').textContent = (isUp||isDn) ? d.confidence+'%' : '--%';
-    document.getElementById('conf-pct').style.color = col;
-    document.getElementById('conf-bar').style.width = (d.confidence||0) + '%';
-    document.getElementById('conf-bar').style.background = col;
-    document.getElementById('pred-window').textContent = d.next_window ? 'Next: ' + d.next_window : '';
+    const sig=d.signal||'HOLD';
+    const isUp=sig==='UP',isDn=sig==='DOWN';
+    const col=isUp?'#00E5A0':isDn?'#FF4560':'#4A6080';
+    document.getElementById('pred-arrow').textContent=isUp?'\u25b2':isDn?'\u25bc':'\u25c6';
+    document.getElementById('pred-arrow').style.color=col;
+    document.getElementById('pred-dir').textContent=isUp?'UP':isDn?'DOWN':'HOLD';
+    document.getElementById('pred-dir').style.color=col;
+    document.getElementById('conf-pct').textContent=(isUp||isDn)?d.confidence+'%':'--%';
+    document.getElementById('conf-pct').style.color=col;
+    document.getElementById('conf-bar').style.width=(d.confidence||0)+'%';
+    document.getElementById('conf-bar').style.background=col;
+    document.getElementById('pred-window').textContent=d.next_window?'Next: '+d.next_window:'';
 
-    if (d.ohlc) {
-      document.getElementById('o-open').textContent  = fmt(d.ohlc.open);
-      document.getElementById('o-high').textContent  = fmt(d.ohlc.high);
-      document.getElementById('o-low').textContent   = fmt(d.ohlc.low);
-      document.getElementById('o-close').textContent = fmt(d.ohlc.close);
+    if(d.ohlc){
+      document.getElementById('o-open').textContent=fmt(d.ohlc.open);
+      document.getElementById('o-high').textContent=fmt(d.ohlc.high);
+      document.getElementById('o-low').textContent=fmt(d.ohlc.low);
+      document.getElementById('o-close').textContent=fmt(d.ohlc.close);
     }
 
-    let w = d.wins||0, l = d.losses||0, tot = w+l;
-    document.getElementById('p-wins').textContent   = w;
-    document.getElementById('p-losses').textContent = l;
-    document.getElementById('p-acc').textContent    = tot ? (w/tot*100).toFixed(1)+'%' : '--%';
+    const w=d.wins||0,l=d.losses||0,tot=w+l;
+    document.getElementById('p-wins').textContent=w;
+    document.getElementById('p-losses').textContent=l;
+    document.getElementById('p-acc').textContent=tot?(w/tot*100).toFixed(1)+'%':'--%';
 
-    let msEl = document.getElementById('model-status');
-    if (d.model_ready) {
-      msEl.textContent  = '✓ Model active';
-      msEl.style.color  = '#00E5A0';
-    } else {
-      msEl.textContent  = '⏳ Collecting data...';
-      msEl.style.color  = '#F7931A';
-    }
-
-    let tbody = document.getElementById('history-body');
-    if (d.table && d.table.length) {
-      tbody.innerHTML = d.table.map(r => {
-        let predCls = r.predicted==='UP'?'up':r.predicted==='DOWN'?'down':'';
-        let actCls  = r.actual==='UP'?'up':r.actual==='DOWN'?'down':'';
-        let predTxt = r.predicted==='UP'?'▲ UP':r.predicted==='DOWN'?'▼ DOWN':r.predicted;
-        let actTxt  = r.actual==='⏳'?'--':r.actual==='UP'?'▲ UP':r.actual==='DOWN'?'▼ DOWN':r.actual;
-        return `<tr>
-          <td style="color:#4A6080">${r.window}</td>
-          <td class="${predCls}">${predTxt}</td>
-          <td style="color:#F7931A">${r.confidence}%</td>
-          <td>${fmt(r.act_open)}</td>
-          <td>${fmt(r.act_close)}</td>
-          <td class="${actCls}">${actTxt}</td>
-          <td>${r.result==='⏳'?'--':r.result}</td>
-        </tr>`;
+    const tbody=document.getElementById('history-body');
+    if(d.table&&d.table.length){
+      tbody.innerHTML=d.table.map(function(r){
+        const predCls=r.predicted==='UP'?'up':r.predicted==='DOWN'?'down':'';
+        const actCls=r.actual==='UP'?'up':r.actual==='DOWN'?'down':'';
+        const predTxt=r.predicted==='UP'?'\u25b2 UP':r.predicted==='DOWN'?'\u25bc DOWN':r.predicted;
+        const actTxt=r.actual==='\u23f3'?'--':r.actual==='UP'?'\u25b2 UP':r.actual==='DOWN'?'\u25bc DOWN':r.actual;
+        return '<tr>'
+          +'<td style="color:#4A6080">'+r.window+'</td>'
+          +'<td class="'+predCls+'">'+predTxt+'</td>'
+          +'<td style="color:#F7931A">'+r.confidence+'%</td>'
+          +'<td>'+fmt(r.act_open)+'</td>'
+          +'<td>'+fmt(r.act_close)+'</td>'
+          +'<td class="'+actCls+'">'+actTxt+'</td>'
+          +'<td>'+(r.result==='\u23f3'?'--':r.result)+'</td>'
+          +'</tr>';
       }).join('');
-    } else {
-      tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:20px;">Waiting for data...</td></tr>';
+    }else{
+      tbody.innerHTML='<tr><td colspan="7" style="text-align:center;padding:20px;">Waiting for data...</td></tr>';
     }
   }
 
@@ -618,7 +615,7 @@ async def lifespan(application: FastAPI):
     _main_loop    = asyncio.get_running_loop()
     _clients_lock = asyncio.Lock()
 
-    # Warm-start
+    # Warm-start with synthetic candles + initial model train
     synth = generate_synthetic_history()
     with state_lock:
         for c in synth:
@@ -632,16 +629,15 @@ async def lifespan(application: FastAPI):
     # Price processor thread
     threading.Thread(target=price_processor_thread, name="price-proc", daemon=True).start()
 
-    # Binance in its own plain daemon thread (no anyio)
+    # Binance: plain daemon thread — keeps asyncio event loop completely free
     threading.Thread(target=_binance_thread, name="binance-ws", daemon=True).start()
 
-    # Async broadcast task
+    # Periodic broadcast to all connected WebSocket clients
     asyncio.create_task(_periodic_broadcast())
 
-    logger.info("=" * 54)
-    logger.info("BTC Predictor ready — Binance live feed + TradingView chart")
-    logger.info(f"Chart Symbol: {TV_CHART_SYMBOL}")
-    logger.info("=" * 54)
+    logger.info("=" * 52)
+    logger.info("BTC Predictor ready")
+    logger.info("=" * 52)
     yield
 
 app = FastAPI(lifespan=lifespan)
@@ -657,19 +653,17 @@ async def ws_endpoint(websocket: WebSocket):
         _clients.append(websocket)
     logger.info(f"WS client connected — total: {len(_clients)}")
     try:
-        # Send initial state immediately
+        # Send current state immediately on connect
         await websocket.send_text(json.dumps(_build_state_payload()))
-        # Keep alive by draining any incoming frames (pings/pongs/close)
-        # The _periodic_broadcast task handles all outgoing sends
+        # Keep alive: actively receive frames with a timeout.
+        # Render's HTTP proxy kills idle WebSockets after ~55s.
+        # On TimeoutError we send a ping to satisfy the proxy.
         while True:
             try:
-                # Wait for any incoming message with a timeout
                 data = await asyncio.wait_for(websocket.receive_text(), timeout=25.0)
-                # If client sends a ping, reply with pong
                 if data == "ping":
                     await websocket.send_text(json.dumps({"type": "pong"}))
             except asyncio.TimeoutError:
-                # Send keepalive ping to prevent Render proxy timeout
                 await websocket.send_text(json.dumps({"type": "ping"}))
     except WebSocketDisconnect:
         pass
