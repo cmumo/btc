@@ -1,7 +1,7 @@
 """
-Gold (XAU/USD) 5-Minute Prediction Terminal  ·  v4.0  (Ultimate Ensemble)
+Bitcoin (BTC/USD) 5-Minute Prediction Terminal  ·  v4.0  (Ultimate Ensemble)
 ====================================================================
-Data Source : Binance PAXG/USDT  (1 PAXG ≈ 1 troy oz gold, spot-pegged)
+Data Source : Binance BTC/USDT  (real‑time trades)
 
 Architecture
 ─────────────
@@ -303,21 +303,21 @@ def get_window_time_range(timestamp: float) -> Tuple[str, str]:
 
 
 # ============================================================
-# SYNTHETIC HISTORY  (gold price ~$3 300/oz)
+# SYNTHETIC HISTORY  (Bitcoin ~ $65,000)
 # ============================================================
 def generate_synthetic_history(n: int = 80) -> List[dict]:
-    candles, price = [], 3_300.0
+    candles, price = [], 65_000.0
     t = time.time() - n * WINDOW_SECONDS
     for i in range(n):
-        o  = price + random.gauss(0, 2.0)
-        c  = o     + random.gauss(0, 3.5)
-        h  = max(o, c) + abs(random.gauss(0, 1.2))
-        lo = min(o, c) - abs(random.gauss(0, 1.2))
+        o  = price + random.gauss(0, 50)
+        c  = o     + random.gauss(0, 120)
+        h  = max(o, c) + abs(random.gauss(0, 25))
+        lo = min(o, c) - abs(random.gauss(0, 25))
         candles.append({
             "ts": t + i * WINDOW_SECONDS,
-            "open": round(o, 3), "high": round(h, 3),
-            "low": round(lo, 3), "close": round(c, 3),
-            "volume": round(random.uniform(0.5, 8.0), 4),
+            "open": round(o, 2), "high": round(h, 2),
+            "low": round(lo, 2), "close": round(c, 2),
+            "volume": round(random.uniform(5, 50), 4),
         })
         price = c
     return candles
@@ -424,7 +424,7 @@ def make_features(candles: List[dict]) -> Optional[pd.DataFrame]:
         (df["close"] - low14) / (high14 - low14 + 1e-9) - 0.5
     ) * 2
 
-    # ── CCI-14 (Commodity Channel Index — key for commodities) ─
+    # ── CCI-14 ────────────────────────────────────────────────
     tp     = (df["high"] + df["low"] + df["close"]) / 3
     tp_ma  = tp.rolling(14, min_periods=1).mean()
     tp_md  = tp.rolling(14, min_periods=1).apply(
@@ -1144,12 +1144,12 @@ def process_price_tick(price: float, trade_ts: float) -> None:
 
 
 # ============================================================
-# BINANCE WEBSOCKET  (PAXG/USDT — 1 token = 1 troy oz gold)
+# BINANCE WEBSOCKET  (BTC/USDT real‑time trades)
 # ============================================================
 def _binance_thread() -> None:
     urls  = [
-        "wss://stream.binance.com:9443/ws/paxgusdt@aggTrade",
-        "wss://stream.binance.com:443/ws/paxgusdt@aggTrade",
+        "wss://stream.binance.com:9443/ws/btcusdt@aggTrade",
+        "wss://stream.binance.com:443/ws/btcusdt@aggTrade",
     ]
     retry = 2
 
@@ -1160,7 +1160,7 @@ def _binance_thread() -> None:
                 def on_open(w):
                     nonlocal retry
                     retry = 2
-                    logger.info("Binance WS connected (PAXG/USDT gold feed)")
+                    logger.info("Binance WS connected (BTC/USDT)")
 
                 def on_message(w, raw):
                     try:
@@ -1239,7 +1239,7 @@ def _build_state_payload() -> dict:
 
     pred       = (predict_from_candles(snap) if snap
                   else {"signal": "HOLD", "confidence": 0, "next_window": ""})
-    ohlc       = ({k: round(lc[k], 3)
+    ohlc       = ({k: round(lc[k], 2)
                    for k in ("open", "high", "low", "close")} if lc else {})
     live_price = (lc["close"] if lc
                   else (snap[-1]["close"] if snap else 0.0))
@@ -1248,7 +1248,7 @@ def _build_state_payload() -> dict:
         model_ready = model is not None
 
     return {
-        "price":       round(live_price, 3),
+        "price":       round(live_price, 2),
         "signal":      pred["signal"],
         "confidence":  pred["confidence"],
         "next_window": pred["next_window"],
@@ -1260,34 +1260,34 @@ def _build_state_payload() -> dict:
 
 
 # ============================================================
-# HTML FRONTEND
+# HTML FRONTEND  (Bitcoin theme, 2 decimal places)
 # ============================================================
 HTML_CONTENT = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=yes">
-<title>Gold 5-Min Predictor</title>
+<title>Bitcoin 5-Min Predictor</title>
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
   body{background:#080C14;color:#C8D8EF;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Roboto','Helvetica Neue',sans-serif;min-height:100vh}
   .container{max-width:1280px;margin:0 auto;padding:12px}
   .header{margin-bottom:12px;padding:8px 0;text-align:center}
-  .header h1{font-size:1.4rem;font-weight:700;color:#D4AF37;letter-spacing:.03em}
+  .header h1{font-size:1.4rem;font-weight:700;color:#F7931A;letter-spacing:.03em}
   .header p{font-size:.72rem;color:#4A6080;margin-top:3px}
   .status-bar{display:flex;align-items:center;gap:10px;margin-bottom:12px;font-size:.8rem;color:#4A6080;flex-wrap:wrap}
   .status-bar #clock-gmt3{color:#fff;margin-left:auto}
   .dot{width:8px;height:8px;border-radius:50%;display:inline-block;flex-shrink:0}
   .dot-ok{background:#00E5A0;box-shadow:0 0 6px #00E5A0}
   .dot-bad{background:#FF4560}
-  .dot-wait{background:#D4AF37;animation:pulse 1.2s infinite}
+  .dot-wait{background:#F7931A;animation:pulse 1.2s infinite}
   @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
   .main-grid{display:grid;grid-template-columns:1fr 340px;gap:12px;margin-bottom:12px;align-items:stretch}
   #tv-chart{background:#0D1421;border-radius:10px;border:1px solid #1E2D45;height:380px;overflow:hidden}
   .sidebar{display:flex;flex-direction:column;gap:12px}
   .card{background:#0D1421;border:1px solid #1E2D45;border-radius:10px;padding:14px}
   .card-title{font-size:.85rem;color:#4A6080;text-transform:uppercase;letter-spacing:.1em;margin-bottom:8px}
-  .price{font-size:2rem;font-weight:700;color:#D4AF37}
+  .price{font-size:2rem;font-weight:700;color:#F7931A}
   .pchange{font-size:.82rem;margin-left:6px}
   .pred-row{display:flex;align-items:center;gap:12px;margin-top:4px}
   .pred-arrow{font-size:2.4rem;line-height:1}
@@ -1296,7 +1296,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
   .conf-fill{height:100%;width:0%;transition:width .4s ease}
   .countdown{display:flex;align-items:center;gap:14px}
   .cd-ring{width:58px;height:58px;transform:rotate(-90deg)}
-  .cd-text{font-size:1.8rem;font-weight:700;color:#D4AF37}
+  .cd-text{font-size:1.8rem;font-weight:700;color:#F7931A}
   .bottom-row{display:grid;gap:12px;grid-template-columns:1fr 1fr;margin-bottom:12px}
   .ohlc-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:6px}
   .ohlc-cell{background:#0F1623;border-radius:6px;padding:7px 10px;border:1px solid #1E2D45}
@@ -1341,8 +1341,8 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 <body>
 <div class="container">
   <div class="header">
-    <h1>&#9728; Gold Price Trend Predictor</h1>
-    <p>XAU/USD &middot; 5-Minute Windows &middot; BiLSTM + AttentionGRU + TCN + XGBoost + RF + LightGBM</p>
+    <h1>₿ Bitcoin Price Trend Predictor</h1>
+    <p>BTC/USD &middot; 5-Minute Windows &middot; BiLSTM + AttentionGRU + TCN + XGBoost + RF + LightGBM</p>
   </div>
   <div class="status-bar">
     <div class="dot dot-wait" id="ws-dot"></div>
@@ -1355,12 +1355,12 @@ HTML_CONTENT = r"""<!DOCTYPE html>
     <div id="tv-chart"><div id="tv-widget" style="width:100%;height:100%"></div></div>
     <div class="sidebar">
       <div class="card">
-        <div class="card-title">Live XAU / USD</div>
+        <div class="card-title">Live BTC / USD</div>
         <div>
           <span class="price" id="price-val">$---.--</span>
           <span class="pchange" id="price-change">--</span>
         </div>
-        <div style="margin-top:6px;font-size:.65rem;color:#4A6080">PAXG/USDT &middot; Binance &middot; 1 token = 1 troy oz</div>
+        <div style="margin-top:6px;font-size:.65rem;color:#4A6080">Binance BTC/USDT &middot; Real‑time trades</div>
       </div>
       <div class="card">
         <div class="card-title">Next 5-Min Prediction</div>
@@ -1377,7 +1377,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
         <div class="countdown">
           <svg class="cd-ring" viewBox="0 0 72 72">
             <circle cx="36" cy="36" r="32" stroke="#1E2D45" stroke-width="5" fill="none"/>
-            <circle cx="36" cy="36" r="32" stroke="#D4AF37" stroke-width="5" fill="none"
+            <circle cx="36" cy="36" r="32" stroke="#F7931A" stroke-width="5" fill="none"
               stroke-dasharray="201" stroke-dashoffset="201" id="cd-ring" stroke-linecap="round"/>
           </svg>
           <div class="cd-text" id="cd-val">5:00</div>
@@ -1401,7 +1401,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       <div class="perf-row">
         <div class="perf-stat"><div class="perf-num up"   id="p-wins">0</div>  <div class="perf-lbl">Wins</div></div>
         <div class="perf-stat"><div class="perf-num down" id="p-losses">0</div><div class="perf-lbl">Losses</div></div>
-        <div class="perf-stat"><div class="perf-num" id="p-acc" style="color:#D4AF37">--</div><div class="perf-lbl">Accuracy</div></div>
+        <div class="perf-stat"><div class="perf-num" id="p-acc" style="color:#F7931A">--</div><div class="perf-lbl">Accuracy</div></div>
       </div>
     </div>
   </div>
@@ -1421,13 +1421,13 @@ HTML_CONTENT = r"""<!DOCTYPE html>
     </div>
   </div>
 
-  <div class="disclaimer">&#9888;&#65039; For educational purposes only. Past accuracy does not guarantee future results. Not financial advice.</div>
+  <div class="disclaimer">⚠️ For educational purposes only. Past accuracy does not guarantee future results. Not financial advice.</div>
 </div>
 
 <script src="https://s3.tradingview.com/tv.js"></script>
 <script>
   new TradingView.widget({
-    container_id:'tv-widget', symbol:'TVC:GOLD', interval:'5',
+    container_id:'tv-widget', symbol:'BITSTAMP:BTCUSD', interval:'5',
     theme:'dark', style:'1', locale:'en', toolbar_bg:'#080C14',
     enable_publishing:false, autosize:true
   });
@@ -1482,11 +1482,11 @@ HTML_CONTENT = r"""<!DOCTYPE html>
         el.className='price '+(p>prevPrice?'flash-up':p<prevPrice?'flash-dn':'');
         setTimeout(()=>{el.className='price';},400);
       }
-      el.textContent=fmt(p,3); prevPrice=p;
+      el.textContent=fmt(p,2); prevPrice=p;
       if(firstPrice===null)firstPrice=p;
       const chg=p-firstPrice, pct=(chg/firstPrice*100).toFixed(2);
       const ce=document.getElementById('price-change');
-      ce.textContent=(chg>=0?'+':'')+fmt(chg,3)+' ('+pct+'%)';
+      ce.textContent=(chg>=0?'+':'')+fmt(chg,2)+' ('+pct+'%)';
       ce.style.color=chg>=0?'#00E5A0':'#FF4560';
     }
 
@@ -1502,19 +1502,19 @@ HTML_CONTENT = r"""<!DOCTYPE html>
     document.getElementById('pred-arrow').style.color=col;
     document.getElementById('pred-dir').textContent=isUp?'UP':isDn?'DOWN':'HOLD';
     document.getElementById('pred-dir').style.color=col;
-    const ce=document.getElementById('conf-pct');
-    if(isHold){ce.textContent='--';ce.style.color='#4A6080';}
-    else{ce.textContent=d.confidence+'%';ce.style.color=col;}
+    const ce2=document.getElementById('conf-pct');
+    if(isHold){ce2.textContent='--';ce2.style.color='#4A6080';}
+    else{ce2.textContent=d.confidence+'%';ce2.style.color=col;}
     document.getElementById('conf-bar').style.width=isHold?'0%':(d.confidence||0)+'%';
     document.getElementById('conf-bar').style.background=col;
     document.getElementById('pred-window').textContent=d.next_window?'Next: '+d.next_window:'';
 
     // OHLC
     if(d.ohlc){
-      document.getElementById('o-open').textContent=fmt(d.ohlc.open,3);
-      document.getElementById('o-high').textContent=fmt(d.ohlc.high,3);
-      document.getElementById('o-low').textContent=fmt(d.ohlc.low,3);
-      document.getElementById('o-close').textContent=fmt(d.ohlc.close,3);
+      document.getElementById('o-open').textContent=fmt(d.ohlc.open,2);
+      document.getElementById('o-high').textContent=fmt(d.ohlc.high,2);
+      document.getElementById('o-low').textContent=fmt(d.ohlc.low,2);
+      document.getElementById('o-close').textContent=fmt(d.ohlc.close,2);
     }
 
     // Performance
@@ -1533,14 +1533,14 @@ HTML_CONTENT = r"""<!DOCTYPE html>
         const pt=r.predicted==='UP'?'▲ UP':r.predicted==='DOWN'?'▼ DOWN':'◆ HOLD';
         const at=r.actual==='⏳'?'--':r.actual==='UP'?'▲ UP':r.actual==='DOWN'?'▼ DOWN':r.actual;
         const ct=isH?'--':r.confidence+'%';
-        const cc=isH?'#4A6080':'#D4AF37';
+        const cc=isH?'#4A6080':'#F7931A';
         const rt=r.result==='⏳'?'⏳':r.result==='—'?'—':r.result;
         return `<tr>
           <td style="color:#4A6080">${r.window}</td>
           <td class="${pc}">${pt}</td>
           <td style="color:${cc}">${ct}</td>
-          <td>${fmt(r.act_open,3)}</td>
-          <td>${fmt(r.act_close,3)}</td>
+          <td>${fmt(r.act_open,2)}</td>
+          <td>${fmt(r.act_close,2)}</td>
           <td class="${ac}">${at}</td>
           <td>${rt}</td>
         </tr>`;
@@ -1635,7 +1635,7 @@ async def lifespan(application: FastAPI):
 
     lgb_note = "LightGBM" if HAS_LGB else "LightGBM (missing — install lightgbm)"
     logger.info("=" * 64)
-    logger.info("Gold Predictor v4.0 — Ultimate Ensemble — ready")
+    logger.info("Bitcoin Predictor v4.0 — Ultimate Ensemble — ready")
     logger.info(f"Models   : BiLSTM · AttentionGRU · TCN · XGBoost · RF · {lgb_note}")
     logger.info(f"Features : {N_FEATURES}  |  Seq len : {SEQ_LEN}  |  History : {HISTORY_LIMIT}")
     logger.info(f"HOLD zone: {SIGNAL_DOWN_THRESH} – {SIGNAL_UP_THRESH} (ultra-tight 2 %)")
