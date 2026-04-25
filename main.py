@@ -5,6 +5,7 @@ Bitcoin 5-Minute Prediction Terminal
 - XGBoost model, 5-min candles, win/loss tracking
 - SQLite database for persistent storage
 - GMT+3 timezone, prices with 2 decimal places
+- Fully responsive for mobile devices
 """
 
 import asyncio
@@ -56,7 +57,6 @@ def init_database():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
-    # Table for completed candles
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS candles (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -69,7 +69,6 @@ def init_database():
         )
     ''')
     
-    # Table for predictions history
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS predictions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -84,7 +83,6 @@ def init_database():
         )
     ''')
     
-    # Table for model storage (binary)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS model (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -95,7 +93,6 @@ def init_database():
         )
     ''')
     
-    # Table for stats
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS stats (
             key TEXT PRIMARY KEY,
@@ -108,7 +105,6 @@ def init_database():
     logger.info(f"Database initialized at {DB_PATH}")
 
 def save_candle(candle: dict):
-    """Save a completed candle to database"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     try:
@@ -123,7 +119,6 @@ def save_candle(candle: dict):
         conn.close()
 
 def load_candles(limit: int = HISTORY_LIMIT) -> List[dict]:
-    """Load recent candles from database"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('''
@@ -136,7 +131,7 @@ def load_candles(limit: int = HISTORY_LIMIT) -> List[dict]:
     conn.close()
     
     candles = []
-    for row in reversed(rows):  # Oldest first
+    for row in reversed(rows):
         candles.append({
             "ts": row[0],
             "open": row[1],
@@ -148,7 +143,6 @@ def load_candles(limit: int = HISTORY_LIMIT) -> List[dict]:
     return candles
 
 def save_prediction(prediction: dict):
-    """Save a prediction to database"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     try:
@@ -165,7 +159,6 @@ def save_prediction(prediction: dict):
         conn.close()
 
 def update_prediction_result(window_time: str, actual_signal: str, actual_open: float, actual_close: float, result: str):
-    """Update prediction with actual result"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     try:
@@ -181,7 +174,6 @@ def update_prediction_result(window_time: str, actual_signal: str, actual_open: 
         conn.close()
 
 def load_predictions(limit: int = 5) -> List[dict]:
-    """Load recent predictions from database"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('''
@@ -194,7 +186,7 @@ def load_predictions(limit: int = 5) -> List[dict]:
     conn.close()
     
     predictions = []
-    for row in reversed(rows):  # Chronological order
+    for row in reversed(rows):
         predictions.append({
             "window": row[0],
             "predicted": row[1],
@@ -207,7 +199,6 @@ def load_predictions(limit: int = 5) -> List[dict]:
     return predictions
 
 def save_model(model_obj, wins: int, losses: int):
-    """Save model to database"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     try:
@@ -224,7 +215,6 @@ def save_model(model_obj, wins: int, losses: int):
         conn.close()
 
 def load_model():
-    """Load model from database"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('SELECT model_data, wins, losses FROM model WHERE id = 1')
@@ -243,7 +233,6 @@ def load_model():
     return None, 0, 0
 
 def save_stats(wins: int, losses: int):
-    """Save win/loss stats to database"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('INSERT OR REPLACE INTO stats (key, value) VALUES (?, ?)', ("wins", wins))
@@ -252,7 +241,6 @@ def save_stats(wins: int, losses: int):
     conn.close()
 
 def load_stats():
-    """Load win/loss stats from database"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('SELECT key, value FROM stats')
@@ -363,7 +351,6 @@ def train_model_from_candles(candles: List[dict]) -> None:
         clf.fit(features_df.values, labels)
         with model_lock:
             model = clf
-        # Save model to database
         save_model(clf, wins, losses)
         logger.info(f"Model trained on {len(labels)} samples and saved to DB")
     except Exception as exc:
@@ -431,24 +418,21 @@ def _close_current_window_locked() -> None:
     completed_candles.append(candle)
     candles_since_retrain += 1
     
-    # Save candle to database
     save_candle(candle)
 
-    # Update prediction with actual result
     for row in reversed(history_rows):
-        if row.get("actual") == "\u23f3":
+        if row.get("actual") == "⏳":
             actual           = "UP" if candle["close"] > candle["open"] else "DOWN"
             row["actual"]    = actual
             row["act_open"]  = candle["open"]
             row["act_close"] = candle["close"]
             if row["predicted"] == actual:
-                row["result"] = "\u2705"
+                row["result"] = "✅"
                 wins += 1
             else:
-                row["result"] = "\u274c"
+                row["result"] = "❌"
                 losses += 1
             
-            # Update in database
             update_prediction_result(row["window"], actual, candle["open"], candle["close"], row["result"])
             save_stats(wins, losses)
             break
@@ -467,11 +451,8 @@ def _close_current_window_locked() -> None:
         "result": "⏳"
     }
     history_rows.append(prediction_record)
-    
-    # Save prediction to database
     save_prediction(prediction_record)
     
-    # Trim history
     del history_rows[:-HISTORY_LIMIT]
 
     if candles_since_retrain >= RETRAIN_EVERY:
@@ -499,7 +480,7 @@ def _coinbase_thread() -> None:
                     "channels": ["matches"]
                 })
                 ws_obj.send(subscribe_msg)
-                logger.info("Coinbase WS connected - receiving BTC-USD trades")
+                logger.info("Coinbase WS connected")
 
             def on_message(ws_obj, raw):
                 try:
@@ -599,69 +580,483 @@ def _build_state_payload() -> dict:
     }
 
 # ============================================================
-# HTML FRONTEND
+# HTML FRONTEND - Fully Responsive with Mobile Support
 # ============================================================
 HTML_CONTENT = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=yes">
 <title>BTC 5-Min Predictor</title>
 <style>
-  *{box-sizing:border-box;margin:0;padding:0}
-  body{background:#080C14;color:#C8D8EF;font-family:'Segoe UI',sans-serif;min-height:100vh;}
-  .container{max-width:1280px;margin:0 auto;padding:14px;}
-  .header{margin-bottom:10px;}
-  .header h1{font-size:1.2rem;font-weight:700;color:#F7931A;letter-spacing:.04em;}
-  .status-bar{display:flex;align-items:center;gap:10px;margin-bottom:12px;font-size:.8rem;color:#4A6080;}
-  .status-bar #clock-gmt3{color:#FFFFFF;}
-  .dot{width:8px;height:8px;border-radius:50%;display:inline-block;flex-shrink:0;}
-  .dot-ok{background:#00E5A0;box-shadow:0 0 6px #00E5A0;}
-  .dot-bad{background:#FF4560;}
-  .dot-wait{background:#F7931A;animation:pulse 1.2s infinite;}
-  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
-  .main-grid{display:grid;grid-template-columns:1fr 340px;gap:14px;margin-bottom:14px;align-items:stretch;}
-  #tv-chart{background:#0D1421;border-radius:10px;border:1px solid #1E2D45;height:380px;overflow:hidden;}
-  .sidebar{display:flex;flex-direction:column;gap:12px;}
-  .sidebar .card:first-child {flex:0 0 auto;}
-  .sidebar .card:nth-child(2) {flex:1;display:flex;flex-direction:column;justify-content:center;}
-  .sidebar .card:nth-child(3) {flex:0 0 auto;}
-  .card{background:#0D1421;border:1px solid #1E2D45;border-radius:10px;padding:14px;}
-  .card-title{font-size:.85rem;color:#4A6080;text-transform:uppercase;letter-spacing:.1em;margin-bottom:8px;}
-  .price{font-size:2rem;font-weight:700;color:#F7931A;}
-  .pchange{font-size:.82rem;margin-left:6px;}
-  .pred-row{display:flex;align-items:center;gap:12px;margin-top:4px;}
-  .pred-arrow{font-size:2.4rem;line-height:1;}
-  .pred-dir{font-size:1.3rem;font-weight:700;}
-  .conf-bar{background:#1E2D45;border-radius:4px;height:6px;margin-top:8px;overflow:hidden;}
-  .conf-fill{height:100%;width:0%;transition:width 0.4s ease;}
-  .countdown{display:flex;align-items:center;gap:14px;}
-  .cd-ring{width:58px;height:58px;transform:rotate(-90deg);}
-  .cd-text{font-size:1.8rem;font-weight:700;color:#F7931A;}
-  .bottom-row{display:grid;gap:14px;grid-template-columns:1fr 1fr;margin-bottom:14px;}
-  @media(max-width:600px){.bottom-row{grid-template-columns:1fr;}}
-  .ohlc-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:6px;}
-  .ohlc-cell{background:#0F1623;border-radius:6px;padding:7px 10px;border:1px solid #1E2D45;}
-  .ohlc-cell .lbl{font-size:.6rem;color:#4A6080;}
-  .ohlc-cell .val{font-size:.88rem;font-weight:700;margin-top:2px;}
-  .perf-row{display:flex;gap:10px;margin-top:8px;}
-  .perf-stat{flex:1;text-align:center;background:#0F1623;border-radius:7px;padding:8px;border:1px solid #1E2D45;}
-  .perf-num{font-size:1.35rem;font-weight:700;}
-  .perf-lbl{font-size:.6rem;color:#4A6080;margin-top:2px;}
-  .table-wrapper{overflow-x:auto;margin-top:10px;}
-  table{width:100%;border-collapse:collapse;font-size:.75rem;}
-  th,td{padding:8px;text-align:left;border-bottom:1px solid #1E2D45;}
-  th{color:#4A6080;font-weight:600;}
-  .up{color:#00E5A0;}.down{color:#FF4560;}
-  .disclaimer{background:#0F1623;border-radius:8px;padding:10px;font-size:.7rem;text-align:center;color:#FACC15;border:1px solid rgba(250,204,21,.13);margin-top:14px;}
-  .flash-up{animation:flashUp .4s ease;}.flash-dn{animation:flashDn .4s ease;}
-  @keyframes flashUp{0%,100%{color:#C8D8EF}50%{color:#00E5A0}}
-  @keyframes flashDn{0%,100%{color:#C8D8EF}50%{color:#FF4560}}
+  * {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+  }
+  
+  body {
+    background: #080C14;
+    color: #C8D8EF;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Helvetica Neue', sans-serif;
+    min-height: 100vh;
+    padding: 0;
+    margin: 0;
+  }
+  
+  .container {
+    max-width: 1280px;
+    margin: 0 auto;
+    padding: 12px;
+  }
+  
+  /* Header Styles */
+  .header {
+    margin-bottom: 12px;
+    padding: 8px 0;
+  }
+  
+  .header h1 {
+    font-size: 1.4rem;
+    font-weight: 700;
+    color: #F7931A;
+    letter-spacing: .02em;
+    padding: 4px 0;
+  }
+  
+  /* Status Bar */
+  .status-bar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 12px;
+    font-size: 0.8rem;
+    color: #4A6080;
+    flex-wrap: wrap;
+  }
+  
+  .status-bar #clock-gmt3 {
+    color: #FFFFFF;
+    margin-left: auto;
+  }
+  
+  .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    display: inline-block;
+    flex-shrink: 0;
+  }
+  
+  .dot-ok {
+    background: #00E5A0;
+    box-shadow: 0 0 6px #00E5A0;
+  }
+  
+  .dot-bad {
+    background: #FF4560;
+  }
+  
+  .dot-wait {
+    background: #F7931A;
+    animation: pulse 1.2s infinite;
+  }
+  
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+  }
+  
+  /* Main Grid - Responsive */
+  .main-grid {
+    display: grid;
+    grid-template-columns: 1fr 340px;
+    gap: 12px;
+    margin-bottom: 12px;
+    align-items: stretch;
+  }
+  
+  #tv-chart {
+    background: #0D1421;
+    border-radius: 10px;
+    border: 1px solid #1E2D45;
+    height: 380px;
+    overflow: hidden;
+  }
+  
+  .sidebar {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  
+  .sidebar .card:first-child {
+    flex: 0 0 auto;
+  }
+  
+  .sidebar .card:nth-child(2) {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+  }
+  
+  .sidebar .card:nth-child(3) {
+    flex: 0 0 auto;
+  }
+  
+  /* Cards */
+  .card {
+    background: #0D1421;
+    border: 1px solid #1E2D45;
+    border-radius: 10px;
+    padding: 14px;
+  }
+  
+  .card-title {
+    font-size: 0.85rem;
+    color: #4A6080;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    margin-bottom: 8px;
+  }
+  
+  /* Price Display */
+  .price {
+    font-size: 2rem;
+    font-weight: 700;
+    color: #F7931A;
+  }
+  
+  .pchange {
+    font-size: 0.82rem;
+    margin-left: 6px;
+  }
+  
+  /* Prediction Display */
+  .pred-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-top: 4px;
+  }
+  
+  .pred-arrow {
+    font-size: 2.4rem;
+    line-height: 1;
+  }
+  
+  .pred-dir {
+    font-size: 1.3rem;
+    font-weight: 700;
+  }
+  
+  .conf-bar {
+    background: #1E2D45;
+    border-radius: 4px;
+    height: 6px;
+    margin-top: 8px;
+    overflow: hidden;
+  }
+  
+  .conf-fill {
+    height: 100%;
+    width: 0%;
+    transition: width 0.4s ease;
+  }
+  
+  /* Countdown */
+  .countdown {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+  }
+  
+  .cd-ring {
+    width: 58px;
+    height: 58px;
+    transform: rotate(-90deg);
+  }
+  
+  .cd-text {
+    font-size: 1.8rem;
+    font-weight: 700;
+    color: #F7931A;
+  }
+  
+  /* Bottom Row */
+  .bottom-row {
+    display: grid;
+    gap: 12px;
+    grid-template-columns: 1fr 1fr;
+    margin-bottom: 12px;
+  }
+  
+  /* OHLC Grid */
+  .ohlc-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    margin-top: 6px;
+  }
+  
+  .ohlc-cell {
+    background: #0F1623;
+    border-radius: 6px;
+    padding: 7px 10px;
+    border: 1px solid #1E2D45;
+  }
+  
+  .ohlc-cell .lbl {
+    font-size: 0.6rem;
+    color: #4A6080;
+  }
+  
+  .ohlc-cell .val {
+    font-size: 0.88rem;
+    font-weight: 700;
+    margin-top: 2px;
+  }
+  
+  /* Performance Stats */
+  .perf-row {
+    display: flex;
+    gap: 10px;
+    margin-top: 8px;
+  }
+  
+  .perf-stat {
+    flex: 1;
+    text-align: center;
+    background: #0F1623;
+    border-radius: 7px;
+    padding: 8px;
+    border: 1px solid #1E2D45;
+  }
+  
+  .perf-num {
+    font-size: 1.35rem;
+    font-weight: 700;
+  }
+  
+  .perf-lbl {
+    font-size: 0.6rem;
+    color: #4A6080;
+    margin-top: 2px;
+  }
+  
+  /* Table Styles */
+  .table-wrapper {
+    overflow-x: auto;
+    margin-top: 10px;
+  }
+  
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.75rem;
+  }
+  
+  th, td {
+    padding: 8px;
+    text-align: left;
+    border-bottom: 1px solid #1E2D45;
+  }
+  
+  th {
+    color: #4A6080;
+    font-weight: 600;
+  }
+  
+  .up {
+    color: #00E5A0;
+  }
+  
+  .down {
+    color: #FF4560;
+  }
+  
+  /* Disclaimer */
+  .disclaimer {
+    background: #0F1623;
+    border-radius: 8px;
+    padding: 10px;
+    font-size: 0.7rem;
+    text-align: center;
+    color: #FACC15;
+    border: 1px solid rgba(250, 204, 21, 0.13);
+    margin-top: 12px;
+  }
+  
+  /* Price Flash Animations */
+  .flash-up {
+    animation: flashUp 0.4s ease;
+  }
+  
+  .flash-dn {
+    animation: flashDn 0.4s ease;
+  }
+  
+  @keyframes flashUp {
+    0%, 100% { color: #C8D8EF; }
+    50% { color: #00E5A0; }
+  }
+  
+  @keyframes flashDn {
+    0%, 100% { color: #C8D8EF; }
+    50% { color: #FF4560; }
+  }
+  
+  /* ============================================================ */
+  /* MEDIA QUERIES FOR MOBILE DEVICES */
+  /* ============================================================ */
+  
+  /* Tablet and smaller desktop */
+  @media (max-width: 900px) {
+    .main-grid {
+      grid-template-columns: 1fr;
+    }
+    
+    #tv-chart {
+      height: 320px;
+    }
+    
+    .sidebar {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 12px;
+    }
+    
+    .sidebar .card:first-child,
+    .sidebar .card:nth-child(2),
+    .sidebar .card:nth-child(3) {
+      flex: auto;
+    }
+    
+    .bottom-row {
+      grid-template-columns: 1fr;
+    }
+    
+    .header h1 {
+      font-size: 1.2rem;
+    }
+  }
+  
+  /* Mobile phones */
+  @media (max-width: 600px) {
+    .container {
+      padding: 8px;
+    }
+    
+    .header h1 {
+      font-size: 1.1rem;
+    }
+    
+    .status-bar {
+      font-size: 0.7rem;
+      gap: 6px;
+    }
+    
+    .sidebar {
+      grid-template-columns: 1fr;
+      gap: 10px;
+    }
+    
+    #tv-chart {
+      height: 260px;
+    }
+    
+    .card {
+      padding: 10px;
+    }
+    
+    .card-title {
+      font-size: 0.75rem;
+    }
+    
+    .price {
+      font-size: 1.5rem;
+    }
+    
+    .pred-arrow {
+      font-size: 1.8rem;
+    }
+    
+    .pred-dir {
+      font-size: 1.1rem;
+    }
+    
+    .cd-text {
+      font-size: 1.4rem;
+    }
+    
+    .cd-ring {
+      width: 48px;
+      height: 48px;
+    }
+    
+    .perf-num {
+      font-size: 1.1rem;
+    }
+    
+    table {
+      font-size: 0.65rem;
+    }
+    
+    th, td {
+      padding: 6px 4px;
+    }
+    
+    .ohlc-cell {
+      padding: 5px 8px;
+    }
+    
+    .ohlc-cell .val {
+      font-size: 0.75rem;
+    }
+    
+    .bottom-row {
+      gap: 10px;
+    }
+  }
+  
+  /* Small mobile devices */
+  @media (max-width: 380px) {
+    .container {
+      padding: 6px;
+    }
+    
+    .header h1 {
+      font-size: 1rem;
+    }
+    
+    .status-bar {
+      font-size: 0.65rem;
+    }
+    
+    .pred-row {
+      gap: 8px;
+    }
+    
+    .countdown {
+      gap: 10px;
+    }
+    
+    table {
+      font-size: 0.6rem;
+    }
+    
+    th, td {
+      padding: 4px 3px;
+    }
+  }
 </style>
 </head>
 <body>
 <div class="container">
-  <div class="header"><h1>&#x20BF; Bitcoin Price Trend Predictor</h1></div>
+  <div class="header">
+    <h1>₿ Bitcoin Price Trend Predictor</h1>
+  </div>
   <div class="status-bar">
     <div class="dot dot-wait" id="ws-dot"></div>
     <span id="ws-txt">Connecting...</span>
@@ -678,7 +1073,7 @@ HTML_CONTENT = """<!DOCTYPE html>
       <div class="card">
         <div class="card-title">Next 5-Min Prediction</div>
         <div class="pred-row">
-          <span class="pred-arrow" id="pred-arrow" style="color:#4A6080">&#x25C6;</span>
+          <span class="pred-arrow" id="pred-arrow" style="color:#4A6080">◆</span>
           <span class="pred-dir" id="pred-dir" style="color:#4A6080">HOLD</span>
           <span id="conf-pct" style="font-size:.85rem;color:#4A6080">--%</span>
         </div>
@@ -720,16 +1115,22 @@ HTML_CONTENT = """<!DOCTYPE html>
   </div>
 
   <div class="card">
-    <div class="card-title">Prediction History (last 5)</div>
+    <div class="card-title">Prediction History (Current to Oldest)</div>
     <div class="table-wrapper">
       <table>
-        <thead><tr><th>Window</th><th>Prediction</th><th>Conf</th><th>Act.Open</th><th>Act.Close</th><th>Actual</th><th>Result</th></tr></thead>
-        <tbody id="history-body"><tr><td colspan="7" style="text-align:center;padding:20px;">Waiting for data...</td></tr></tbody>
+        <thead>
+          <tr>
+            <th>Window</th><th>Prediction</th><th>Conf</th><th>Act.Open</th><th>Act.Close</th><th>Actual</th><th>Result</th>
+          </tr>
+        </thead>
+        <tbody id="history-body">
+          <tr><td colspan="7" style="text-align:center;padding:20px;">Waiting for data...</td></tr>
+        </tbody>
       </table>
     </div>
   </div>
 
-  <div class="disclaimer">&#x26A0;&#xFE0F; For educational purposes only. Past accuracy does not guarantee future results.</div>
+  <div class="disclaimer">⚠️ For educational purposes only. Past accuracy does not guarantee future results.</div>
 </div>
 
 <script src="https://s3.tradingview.com/tv.js"></script>
@@ -773,7 +1174,7 @@ HTML_CONTENT = """<!DOCTYPE html>
     ws=new WebSocket(wsUrl);
     ws.onopen=function(){
       document.getElementById('ws-dot').className='dot dot-ok';
-      document.getElementById('ws-txt').textContent='Live (Coinbase)';
+      document.getElementById('ws-txt').textContent='Live';
     };
     ws.onclose=function(){
       document.getElementById('ws-dot').className='dot dot-bad';
@@ -811,7 +1212,7 @@ HTML_CONTENT = """<!DOCTYPE html>
     const sig=d.signal||'HOLD';
     const isUp=sig==='UP',isDn=sig==='DOWN';
     const col=isUp?'#00E5A0':isDn?'#FF4560':'#4A6080';
-    document.getElementById('pred-arrow').textContent=isUp?'\u25b2':isDn?'\u25bc':'\u25c6';
+    document.getElementById('pred-arrow').textContent=isUp?'▲':isDn?'▼':'◆';
     document.getElementById('pred-arrow').style.color=col;
     document.getElementById('pred-dir').textContent=isUp?'UP':isDn?'DOWN':'HOLD';
     document.getElementById('pred-dir').style.color=col;
@@ -838,8 +1239,8 @@ HTML_CONTENT = """<!DOCTYPE html>
       tbody.innerHTML=d.table.map(function(r){
         const predCls=r.predicted==='UP'?'up':r.predicted==='DOWN'?'down':'';
         const actCls=r.actual==='UP'?'up':r.actual==='DOWN'?'down':'';
-        const predTxt=r.predicted==='UP'?'\u25b2 UP':r.predicted==='DOWN'?'\u25bc DOWN':r.predicted;
-        const actTxt=r.actual==='\u23f3'?'--':r.actual==='UP'?'\u25b2 UP':r.actual==='DOWN'?'\u25bc DOWN':r.actual;
+        const predTxt=r.predicted==='UP'?'▲ UP':r.predicted==='DOWN'?'▼ DOWN':r.predicted;
+        const actTxt=r.actual==='⏳'?'--':r.actual==='UP'?'▲ UP':r.actual==='DOWN'?'▼ DOWN':r.actual;
         return '<tr>'
           +'<td style="color:#4A6080">'+r.window+'</td>'
           +'<td class="'+predCls+'">'+predTxt+'</td>'
@@ -847,7 +1248,7 @@ HTML_CONTENT = """<!DOCTYPE html>
           +'<td>'+fmt(r.act_open)+'</td>'
           +'<td>'+fmt(r.act_close)+'</td>'
           +'<td class="'+actCls+'">'+actTxt+'</td>'
-          +'<td>'+(r.result==='\u23f3'?'--':r.result)+'</td>'
+          +'<td>'+(r.result==='⏳'?'--':r.result)+'</td>'
           +'</tr>';
       }).join('');
     }else{
@@ -870,10 +1271,8 @@ async def lifespan(application: FastAPI):
     _main_loop    = asyncio.get_running_loop()
     _clients_lock = asyncio.Lock()
     
-    # Initialize database
     init_database()
     
-    # Load saved model and stats from database
     saved_model, saved_wins, saved_losses = load_model()
     if saved_model:
         with model_lock:
@@ -882,14 +1281,12 @@ async def lifespan(application: FastAPI):
         losses = saved_losses
         logger.info(f"Loaded saved model with {wins} wins, {losses} losses")
     
-    # Load saved predictions history
     saved_predictions = load_predictions(HISTORY_LIMIT)
     if saved_predictions:
         with state_lock:
             history_rows = saved_predictions
         logger.info(f"Loaded {len(saved_predictions)} predictions from database")
     
-    # Load saved candles
     saved_candles = load_candles(HISTORY_LIMIT)
     if saved_candles:
         with state_lock:
@@ -897,7 +1294,6 @@ async def lifespan(application: FastAPI):
                 completed_candles.append(candle)
         logger.info(f"Loaded {len(saved_candles)} candles from database")
     
-    # If no model exists, generate synthetic data and train
     if model is None:
         logger.info("No saved model found, generating synthetic data...")
         synth = generate_synthetic_history()
@@ -911,20 +1307,16 @@ async def lifespan(application: FastAPI):
             daemon=True, name="initial-train",
         ).start()
 
-    # Start threads
     threading.Thread(target=price_processor_thread, name="price-proc", daemon=True).start()
     threading.Thread(target=_coinbase_thread, name="coinbase-ws", daemon=True).start()
-    
-    # Periodic broadcast
     asyncio.create_task(_periodic_broadcast())
 
     port = os.environ.get("PORT", "8000")
     logger.info("=" * 52)
-    logger.info(f"BTC Predictor ready — Coinbase live feed — Database at {DB_PATH}")
+    logger.info(f"BTC Predictor ready — Database at {DB_PATH}")
     logger.info("=" * 52)
     yield
     
-    # Save final state on shutdown
     if model:
         save_model(model, wins, losses)
     save_stats(wins, losses)
@@ -969,9 +1361,6 @@ async def ws_endpoint(websocket: WebSocket):
                 _clients.remove(websocket)
         logger.info(f"WS client disconnected — total: {len(_clients)}")
 
-# ============================================================
-# ENTRY POINT
-# ============================================================
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
