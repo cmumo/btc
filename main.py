@@ -746,7 +746,7 @@ HTML_CONTENT = """<!DOCTYPE html>
 </head>
 <body>
 <div class="container">
-  <div class="header"><h1>₿ Bitcoin Price Trend Predictor</h1></div>
+  <div class="header"><h1>₿ 5-Minute BTC Price Trend Predictor</h1></div>
   <div class="status-bar">
     <div class="dot dot-wait" id="ws-dot"></div>
     <span id="ws-txt">Connecting...</span>
