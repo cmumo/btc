@@ -45,9 +45,11 @@ MIN_CANDLES_TRAIN = 12
 RETRAIN_EVERY     = 5
 TZ                = timezone(timedelta(hours=3))  # GMT+3
 
-# Database setup
+# Database setup - Use persistent path
 DB_PATH = os.environ.get("DATABASE_PATH", "/data/predictions.db")
+# Create directory if it doesn't exist
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+logger.info(f"Database path: {DB_PATH}")
 
 # ============================================================
 # DATABASE SETUP
@@ -105,6 +107,7 @@ def init_database():
     logger.info(f"Database initialized at {DB_PATH}")
 
 def save_candle(candle: dict):
+    """Save a completed candle to database"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     try:
@@ -119,6 +122,7 @@ def save_candle(candle: dict):
         conn.close()
 
 def load_candles(limit: int = HISTORY_LIMIT) -> List[dict]:
+    """Load recent candles from database"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('''
@@ -143,6 +147,7 @@ def load_candles(limit: int = HISTORY_LIMIT) -> List[dict]:
     return candles
 
 def save_prediction(prediction: dict):
+    """Save a prediction to database"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     try:
@@ -153,12 +158,14 @@ def save_prediction(prediction: dict):
               prediction.get("actual", "⏳"), prediction.get("act_open", 0), 
               prediction.get("act_close", 0), prediction.get("result", "⏳")))
         conn.commit()
+        logger.info(f"Saved prediction for {prediction['window']}")
     except Exception as e:
         logger.error(f"Failed to save prediction: {e}")
     finally:
         conn.close()
 
 def update_prediction_result(window_time: str, actual_signal: str, actual_open: float, actual_close: float, result: str):
+    """Update prediction with actual result"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     try:
@@ -168,12 +175,14 @@ def update_prediction_result(window_time: str, actual_signal: str, actual_open: 
             WHERE window_time = ?
         ''', (actual_signal, actual_open, actual_close, result, window_time))
         conn.commit()
+        logger.info(f"Updated prediction result for {window_time}: {result}")
     except Exception as e:
         logger.error(f"Failed to update prediction: {e}")
     finally:
         conn.close()
 
 def load_predictions(limit: int = 5) -> List[dict]:
+    """Load recent predictions from database (most recent first)"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('''
@@ -186,7 +195,7 @@ def load_predictions(limit: int = 5) -> List[dict]:
     conn.close()
     
     predictions = []
-    for row in reversed(rows):
+    for row in rows:  # Already in DESC order (newest first)
         predictions.append({
             "window": row[0],
             "predicted": row[1],
@@ -199,6 +208,7 @@ def load_predictions(limit: int = 5) -> List[dict]:
     return predictions
 
 def save_model(model_obj, wins: int, losses: int):
+    """Save model to database"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     try:
@@ -215,6 +225,7 @@ def save_model(model_obj, wins: int, losses: int):
         conn.close()
 
 def load_model():
+    """Load model from database"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('SELECT model_data, wins, losses FROM model WHERE id = 1')
@@ -233,14 +244,17 @@ def load_model():
     return None, 0, 0
 
 def save_stats(wins: int, losses: int):
+    """Save win/loss stats to database"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('INSERT OR REPLACE INTO stats (key, value) VALUES (?, ?)', ("wins", wins))
     cursor.execute('INSERT OR REPLACE INTO stats (key, value) VALUES (?, ?)', ("losses", losses))
     conn.commit()
     conn.close()
+    logger.info(f"Stats saved - Wins: {wins}, Losses: {losses}")
 
 def load_stats():
+    """Load win/loss stats from database"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('SELECT key, value FROM stats')
@@ -351,6 +365,7 @@ def train_model_from_candles(candles: List[dict]) -> None:
         clf.fit(features_df.values, labels)
         with model_lock:
             model = clf
+        # Save model to database
         save_model(clf, wins, losses)
         logger.info(f"Model trained on {len(labels)} samples and saved to DB")
     except Exception as exc:
@@ -418,9 +433,11 @@ def _close_current_window_locked() -> None:
     completed_candles.append(candle)
     candles_since_retrain += 1
     
+    # Save candle to database
     save_candle(candle)
 
-    for row in reversed(history_rows):
+    # Update prediction with actual result
+    for row in history_rows:  # Iterate forward, find first pending
         if row.get("actual") == "⏳":
             actual           = "UP" if candle["close"] > candle["open"] else "DOWN"
             row["actual"]    = actual
@@ -433,6 +450,7 @@ def _close_current_window_locked() -> None:
                 row["result"] = "❌"
                 losses += 1
             
+            # Update in database
             update_prediction_result(row["window"], actual, candle["open"], candle["close"], row["result"])
             save_stats(wins, losses)
             break
@@ -450,11 +468,15 @@ def _close_current_window_locked() -> None:
         "actual": "⏳",
         "result": "⏳"
     }
-    history_rows.append(prediction_record)
+    # Insert at beginning for newest-first display
+    history_rows.insert(0, prediction_record)
     save_prediction(prediction_record)
     
-    del history_rows[:-HISTORY_LIMIT]
-
+    # Keep only last 5 in memory for display
+    while len(history_rows) > 5:
+        history_rows.pop()
+    
+    # Save model if needed
     if candles_since_retrain >= RETRAIN_EVERY:
         candles_since_retrain = 0
         threading.Thread(
@@ -474,22 +496,26 @@ def _coinbase_thread() -> None:
             def on_open(ws_obj):
                 nonlocal retry_delay
                 retry_delay = 2
+                # Subscribe to ticker channel for real-time updates
                 subscribe_msg = json.dumps({
                     "type": "subscribe",
                     "product_ids": ["BTC-USD"],
-                    "channels": ["matches"]
+                    "channels": ["ticker", "matches"]
                 })
                 ws_obj.send(subscribe_msg)
-                logger.info("Coinbase WS connected")
+                logger.info("Coinbase WS connected - receiving real-time data")
 
             def on_message(ws_obj, raw):
                 try:
                     data = json.loads(raw)
-                    if data.get("type") == "match":
-                        price_queue.put_nowait({
-                            "price": float(data["price"]),
-                            "ts":    time.time(),
-                        })
+                    msg_type = data.get("type")
+                    if msg_type in ["ticker", "match"]:
+                        price = float(data.get("price", 0))
+                        if price > 0:
+                            price_queue.put_nowait({
+                                "price": price,
+                                "ts":    time.time(),
+                            })
                 except Exception:
                     pass
 
@@ -557,7 +583,7 @@ def _build_state_payload() -> dict:
         snap = list(completed_candles)
         lc   = dict(live_candle) if live_candle else None
         w, l = wins, losses
-        rows = list(history_rows[-5:])
+        rows = list(history_rows[:5])  # Get first 5 (newest first)
 
     pred       = predict_from_candles(snap) if snap else \
                  {"signal": "HOLD", "confidence": 0, "next_window": ""}
@@ -610,10 +636,11 @@ HTML_CONTENT = """<!DOCTYPE html>
     padding: 12px;
   }
   
-  /* Header Styles */
+  /* Header Styles - Center Aligned */
   .header {
     margin-bottom: 12px;
     padding: 8px 0;
+    text-align: center;
   }
   
   .header h1 {
@@ -1115,7 +1142,7 @@ HTML_CONTENT = """<!DOCTYPE html>
   </div>
 
   <div class="card">
-    <div class="card-title">Prediction History (Last 5)</div>
+    <div class="card-title">Last 5 Predictions</div>
     <div class="table-wrapper">
       <table>
         <thead>
@@ -1271,22 +1298,35 @@ async def lifespan(application: FastAPI):
     _main_loop    = asyncio.get_running_loop()
     _clients_lock = asyncio.Lock()
     
+    # Initialize database
     init_database()
     
-    saved_model, saved_wins, saved_losses = load_model()
+    # Load saved stats FIRST
+    db_wins, db_losses = load_stats()
+    if db_wins > 0 or db_losses > 0:
+        wins = db_wins
+        losses = db_losses
+        logger.info(f"Loaded stats from DB: {wins} wins, {losses} losses")
+    
+    # Load saved model
+    saved_model, model_wins, model_losses = load_model()
     if saved_model:
         with model_lock:
             model = saved_model
-        wins = saved_wins
-        losses = saved_losses
-        logger.info(f"Loaded saved model with {wins} wins, {losses} losses")
+        # Use the stats from model if they're higher (more recent)
+        if model_wins > wins:
+            wins = model_wins
+            losses = model_losses
+        logger.info(f"Loaded model with {wins} wins, {losses} losses")
     
-    saved_predictions = load_predictions(HISTORY_LIMIT)
+    # Load saved predictions (newest first)
+    saved_predictions = load_predictions(5)  # Only need last 5 for display
     if saved_predictions:
         with state_lock:
             history_rows = saved_predictions
         logger.info(f"Loaded {len(saved_predictions)} predictions from database")
     
+    # Load saved candles
     saved_candles = load_candles(HISTORY_LIMIT)
     if saved_candles:
         with state_lock:
@@ -1294,6 +1334,7 @@ async def lifespan(application: FastAPI):
                 completed_candles.append(candle)
         logger.info(f"Loaded {len(saved_candles)} candles from database")
     
+    # If no model exists, generate synthetic data and train
     if model is None:
         logger.info("No saved model found, generating synthetic data...")
         synth = generate_synthetic_history()
@@ -1306,21 +1347,31 @@ async def lifespan(application: FastAPI):
             args=(list(completed_candles),),
             daemon=True, name="initial-train",
         ).start()
-
+    else:
+        logger.info(f"Using existing model with {len(completed_candles)} candles loaded")
+    
+    # Force save stats immediately to ensure they persist
+    save_stats(wins, losses)
+    
+    # Start threads
     threading.Thread(target=price_processor_thread, name="price-proc", daemon=True).start()
     threading.Thread(target=_coinbase_thread, name="coinbase-ws", daemon=True).start()
+    
+    # Periodic broadcast
     asyncio.create_task(_periodic_broadcast())
 
     port = os.environ.get("PORT", "8000")
     logger.info("=" * 52)
     logger.info(f"BTC Predictor ready — Database at {DB_PATH}")
+    logger.info(f"Current stats: {wins} wins, {losses} losses")
     logger.info("=" * 52)
     yield
     
+    # Save final state on shutdown
     if model:
         save_model(model, wins, losses)
     save_stats(wins, losses)
-    logger.info("Final state saved to database")
+    logger.info(f"Final state saved - Wins: {wins}, Losses: {losses}")
 
 app = FastAPI(lifespan=lifespan)
 
