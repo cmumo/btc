@@ -1,8 +1,7 @@
 """
-Bitcoin 5-Minute Prediction Terminal
-=====================================
-- TradingView WebSocket (unofficial) for live BTC price ticks
-- TradingView chart widget (BINANCE:BTCUSDT) — same source as backend
+Bitcoin 5-Minute Prediction Terminal - RENDER READY
+====================================================
+- TradingView chart (BITSTAMP:BTCUSD) + Binance WebSocket for live prices
 - XGBoost model, 5-min candles, win/loss tracking
 - GMT+3 timezone, prices with 2 decimal places
 - Correct port binding for Render ($PORT)
@@ -14,8 +13,6 @@ import json
 import logging
 import os
 import random
-import re
-import string
 import threading
 import time
 from collections import deque
@@ -43,34 +40,23 @@ logger = logging.getLogger(__name__)
 # ============================================================
 # CONSTANTS
 # ============================================================
-WINDOW_SECONDS    = 300          # 5-minute candles
-HISTORY_LIMIT     = 100
-MIN_CANDLES_TRAIN = 12
-RETRAIN_EVERY     = 5
-TZ                = timezone(timedelta(hours=3))   # GMT+3
-
-# TradingView symbol — must match the chart widget below
-TV_SYMBOL  = "BINANCE:BTCUSDT"
-TV_WS_URL  = "wss://data.tradingview.com/socket.io/websocket?from=chart%2F&date="
-TV_HEADERS = {
-    "Origin":     "https://www.tradingview.com",
-    "User-Agent": (
-        "Mozilla/5.0 (X11; Linux x86_64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    ),
-}
+WINDOW_SECONDS     = 300
+HISTORY_LIMIT      = 100
+MIN_CANDLES_TRAIN  = 12
+RETRAIN_EVERY      = 5
+TZ                 = timezone(timedelta(hours=3))   # GMT+3
+TV_CHART_SYMBOL    = "BITSTAMP:BTCUSD"
 
 # ============================================================
-# SHARED STATE  (all mutation under state_lock)
+# SHARED STATE
 # ============================================================
-state_lock            = threading.Lock()
-completed_candles:    Deque[dict]   = deque(maxlen=HISTORY_LIMIT)
-history_rows:         List[dict]    = []
-live_candle:          Optional[dict] = None
-live_window_start:    Optional[float] = None
-wins:                 int = 0
-losses:               int = 0
+state_lock             = threading.Lock()
+completed_candles:     Deque[dict]   = deque(maxlen=HISTORY_LIMIT)
+history_rows:          List[dict]    = []
+live_candle:           Optional[dict] = None
+live_window_start:     Optional[float] = None
+wins:                  int = 0
+losses:                int = 0
 candles_since_retrain: int = 0
 
 model      = None
@@ -78,132 +64,12 @@ model_lock = threading.Lock()
 
 price_queue: Queue = Queue()
 
-_clients:      List[WebSocket]                      = []
-_clients_lock: Optional[asyncio.Lock]               = None   # created in lifespan
-_main_loop:    Optional[asyncio.AbstractEventLoop]  = None
+_clients:      List[WebSocket]                     = []
+_clients_lock: Optional[asyncio.Lock]              = None
+_main_loop:    Optional[asyncio.AbstractEventLoop] = None
 
 # ============================================================
-# TRADINGVIEW WEBSOCKET HELPERS
-# ============================================================
-def _rand_str(n: int = 12) -> str:
-    return "".join(random.choices(string.ascii_lowercase + string.digits, k=n))
-
-
-def _pack(text: str) -> str:
-    """Wrap a string in TradingView wire format:  ~m~<len>~m~<text>"""
-    return f"~m~{len(text)}~m~{text}"
-
-
-def _tv_msg(func: str, args: list) -> str:
-    """Serialise and pack a TradingView JSON message."""
-    body = json.dumps({"m": func, "p": args}, separators=(",", ":"))
-    return _pack(body)
-
-
-def _parse_packets(raw: str) -> List[str]:
-    """
-    Extract all payloads from a raw TV frame.
-    Wire format: ~m~<len>~m~<payload>  (may repeat multiple times per recv)
-    """
-    packets, i = [], 0
-    while i < len(raw):
-        if raw[i: i + 3] != "~m~":
-            i += 1
-            continue
-        try:
-            end_len = raw.index("~m~", i + 3)
-            length  = int(raw[i + 3: end_len])
-            start   = end_len + 3
-            packets.append(raw[start: start + length])
-            i = start + length
-        except (ValueError, IndexError):
-            break
-    return packets
-
-
-# ============================================================
-# TRADINGVIEW WEBSOCKET THREAD  (replaces Binance WS)
-# ============================================================
-def tradingview_ws_thread() -> None:
-    """
-    Connects to TradingView's real-time quote feed, subscribes to
-    TV_SYMBOL, and pushes every last-price tick into price_queue.
-
-    TradingView wire protocol:
-      - Messages are packed as  ~m~<len>~m~<json>
-      - Server sends heartbeats like  ~h~N  — we must echo them back
-      - Quote updates arrive as  {"m":"qsd","p":[session, symbol, {"v":{"lp":<price>,...}}]}
-    """
-    retry_delay = 2
-
-    while True:
-        logger.info("Connecting to TradingView WebSocket ...")
-        try:
-            ws = ws_client.create_connection(
-                TV_WS_URL,
-                header=[f"{k}: {v}" for k, v in TV_HEADERS.items()],
-                timeout=15,
-            )
-
-            qs = "qs_" + _rand_str()   # unique quote-session id
-
-            # Handshake sequence
-            ws.send(_tv_msg("set_auth_token",       ["unauthorized_user_token"]))
-            ws.send(_tv_msg("quote_create_session",  [qs]))
-            ws.send(_tv_msg("quote_set_fields",      [
-                qs, "lp", "lp_time", "volume", "ch", "chp", "bid", "ask",
-            ]))
-            ws.send(_tv_msg("quote_add_symbols",     [
-                qs, TV_SYMBOL, {"flags": ["force_permission"]},
-            ]))
-            ws.send(_tv_msg("quote_fast_symbols",    [qs, TV_SYMBOL]))
-
-            logger.info(f"TradingView WS connected (session={qs})")
-            retry_delay = 2   # reset backoff on successful connect
-
-            while True:
-                raw = ws.recv()
-                if not raw:
-                    continue
-
-                packets = _parse_packets(raw)
-
-                for packet in packets:
-                    if not packet:
-                        continue
-
-                    # Echo heartbeats so the server keeps the connection alive
-                    if packet.startswith("~h~"):
-                        ws.send(_pack(packet))
-                        continue
-
-                    try:
-                        msg = json.loads(packet)
-                    except (json.JSONDecodeError, ValueError):
-                        continue
-
-                    # Real-time quote update
-                    if msg.get("m") == "qsd":
-                        p = msg.get("p", [])
-                        if len(p) >= 2:
-                            v  = p[1].get("v", {})
-                            lp = v.get("lp")
-                            if lp is not None:
-                                ts = float(v["lp_time"]) if v.get("lp_time") else time.time()
-                                price_queue.put_nowait({"price": float(lp), "ts": ts})
-
-        except ws_client.WebSocketConnectionClosedException:
-            logger.warning("TradingView WS connection closed")
-        except Exception as exc:
-            logger.error(f"TradingView WS error: {exc}")
-
-        logger.info(f"TradingView WS reconnecting in {retry_delay}s ...")
-        time.sleep(retry_delay)
-        retry_delay = min(retry_delay * 2, 60)
-
-
-# ============================================================
-# SYNTHETIC HISTORY  (warm-start the model before live data)
+# SYNTHETIC HISTORY
 # ============================================================
 def generate_synthetic_history(n: int = 60) -> List[dict]:
     candles, price = [], 65_000.0
@@ -223,7 +89,6 @@ def generate_synthetic_history(n: int = 60) -> List[dict]:
         })
         price = c
     return candles
-
 
 # ============================================================
 # FEATURE ENGINEERING
@@ -247,7 +112,6 @@ def make_features(candles: List[dict]) -> Optional[pd.DataFrame]:
     cols = ["ret", "hl", "oc", "ma_diff", "vol_ratio",
             "ret_lag1", "ret_lag2", "momentum"]
     return df[cols] if len(df) >= 1 else None
-
 
 # ============================================================
 # MODEL TRAINING
@@ -289,7 +153,6 @@ def train_model_from_candles(candles: List[dict]) -> None:
     except Exception as exc:
         logger.error(f"Training error: {exc}")
 
-
 # ============================================================
 # PREDICTION
 # ============================================================
@@ -326,7 +189,6 @@ def predict_from_candles(candles: List[dict]) -> dict:
         logger.error(f"Prediction error: {exc}")
         return default
 
-
 # ============================================================
 # CANDLE BUILDING
 # ============================================================
@@ -349,14 +211,11 @@ def process_price_tick(price: float, trade_ts: float) -> None:
             live_candle["low"]   = min(live_candle["low"],   price)
             live_candle["close"] = price
 
-
 def _new_candle(ts: float, price: float) -> dict:
     return {"ts": ts, "open": price, "high": price,
             "low": price, "close": price, "volume": 0.0}
 
-
 def _close_current_window_locked() -> None:
-    """Must be called with state_lock held."""
     global live_candle, candles_since_retrain, wins, losses
 
     candle       = dict(live_candle)
@@ -364,7 +223,6 @@ def _close_current_window_locked() -> None:
     completed_candles.append(candle)
     candles_since_retrain += 1
 
-    # Score the most recent pending prediction
     for row in reversed(history_rows):
         if row.get("actual") == "⏳":
             actual           = "UP" if candle["close"] > candle["open"] else "DOWN"
@@ -377,7 +235,6 @@ def _close_current_window_locked() -> None:
                 row["result"] = "❌"; losses += 1
             break
 
-    # New prediction for the window that just opened
     snap = list(completed_candles)
     pred = predict_from_candles(snap)
     dt   = datetime.fromtimestamp(candle["ts"], tz=TZ).strftime("%H:%M")
@@ -400,6 +257,48 @@ def _close_current_window_locked() -> None:
             args=(snap,), daemon=True,
         ).start()
 
+# ============================================================
+# BINANCE WEBSOCKET — runs in a dedicated daemon thread
+# ============================================================
+def _binance_thread() -> None:
+    """Dedicated thread: connects to Binance, auto-reconnects on failure."""
+    url = "wss://stream.binance.com:9443/ws/btcusdt@trade"
+    retry_delay = 2
+
+    while True:
+        logger.info("Connecting to Binance WebSocket...")
+        try:
+            def on_message(ws_obj, raw):
+                try:
+                    data = json.loads(raw)
+                    if data.get("e") == "trade":
+                        price = float(data["p"])
+                        ts    = float(data["T"]) / 1000.0
+                        price_queue.put_nowait({"price": price, "ts": ts})
+                except Exception:
+                    pass
+
+            def on_error(ws_obj, err):
+                logger.error(f"Binance WS error: {err}")
+
+            def on_open(ws_obj):
+                nonlocal retry_delay
+                retry_delay = 2
+                logger.info("Binance WS connected")
+
+            app_ws = ws_client.WebSocketApp(
+                url,
+                on_message=on_message,
+                on_error=on_error,
+                on_open=on_open,
+            )
+            app_ws.run_forever(ping_interval=20, ping_timeout=10)
+        except Exception as exc:
+            logger.error(f"Binance thread error: {exc}")
+
+        logger.warning(f"Binance WS reconnecting in {retry_delay}s...")
+        time.sleep(retry_delay)
+        retry_delay = min(retry_delay * 2, 60)
 
 # ============================================================
 # PRICE PROCESSOR THREAD
@@ -414,7 +313,6 @@ def price_processor_thread() -> None:
         except Exception as exc:
             logger.error(f"Price processor error: {exc}")
 
-
 # ============================================================
 # WEBSOCKET BROADCAST
 # ============================================================
@@ -422,7 +320,6 @@ async def _periodic_broadcast() -> None:
     while True:
         await asyncio.sleep(1)
         await _broadcast_state()
-
 
 async def _broadcast_state() -> None:
     payload = _build_state_payload()
@@ -437,7 +334,6 @@ async def _broadcast_state() -> None:
         for ws in dead:
             if ws in _clients:
                 _clients.remove(ws)
-
 
 def _build_state_payload() -> dict:
     with state_lock:
@@ -466,7 +362,6 @@ def _build_state_payload() -> dict:
         "table":       rows,
         "model_ready": model_ready,
     }
-
 
 # ============================================================
 # HTML FRONTEND
@@ -519,7 +414,7 @@ HTML_CONTENT = """<!DOCTYPE html>
 <body>
 <div class="container">
   <div class="header">
-    <div class="logo">&#8383; BTC Predictor</div>
+    <div class="logo">₿ BTC Predictor</div>
     <div class="status">
       <span class="dot dot-bad" id="ws-dot"></span>
       <span id="ws-txt">Connecting...</span>
@@ -537,7 +432,7 @@ HTML_CONTENT = """<!DOCTYPE html>
     </div>
     <div class="card pred-box">
       <div class="card-title">Next 5-Min Signal</div>
-      <div class="pred-arrow" id="pred-arrow">&#9670;</div>
+      <div class="pred-arrow" id="pred-arrow">◆</div>
       <div class="pred-dir" id="pred-dir" style="color:#4A6080">HOLD</div>
       <div class="conf-label">Confidence: <span id="conf-pct">--%</span></div>
       <div class="conf-bar-bg"><div class="conf-bar" id="conf-bar" style="width:0%"></div></div>
@@ -564,9 +459,8 @@ HTML_CONTENT = """<!DOCTYPE html>
       </div>
     </div>
     <div class="card">
-      <div class="card-title">Data Source</div>
-      <div id="model-status" style="color:#F7931A;font-size:.85rem">&#8987; Collecting data...</div>
-      <div style="color:#4A6080;font-size:.75rem;margin-top:8px;">&#128250; TradingView &mdash; BINANCE:BTCUSDT</div>
+      <div class="card-title">Model Status</div>
+      <div id="model-status" style="color:#F7931A;font-size:.85rem">⏳ Collecting data...</div>
     </div>
   </div>
 
@@ -575,10 +469,7 @@ HTML_CONTENT = """<!DOCTYPE html>
     <div class="table-wrapper">
       <table>
         <thead>
-          <tr>
-            <th>Window</th><th>Prediction</th><th>Conf</th>
-            <th>Act.Open</th><th>Act.Close</th><th>Actual</th><th>Result</th>
-          </tr>
+          <tr><th>Window</th><th>Prediction</th><th>Conf</th><th>Act.Open</th><th>Act.Close</th><th>Actual</th><th>Result</th></tr>
         </thead>
         <tbody id="history-body">
           <tr><td colspan="7" style="text-align:center;padding:20px;">Waiting for data...</td></tr>
@@ -587,37 +478,42 @@ HTML_CONTENT = """<!DOCTYPE html>
     </div>
   </div>
 
-  <div class="disclaimer">&#9888;&#65039; For educational purpose only. Past accuracy does not guarantee future results.</div>
+  <div class="disclaimer">⚠️ For educational purposes only. Past accuracy does not guarantee future results.</div>
 </div>
 
 <script src="https://s3.tradingview.com/tv.js"></script>
 <script>
-  // Chart widget uses same symbol as backend data feed
   new TradingView.widget({
-    container_id:'tv-widget', symbol:'BINANCE:BTCUSDT', interval:'5',
-    theme:'dark', style:'1', locale:'en', toolbar_bg:'#080C14',
-    enable_publishing:false, autosize:true
+    container_id:'tv-widget',
+    symbol:'BITSTAMP:BTCUSD',
+    interval:'5',
+    theme:'dark',
+    style:'1',
+    locale:'en',
+    toolbar_bg:'#080C14',
+    enable_publishing:false,
+    autosize:true
   });
 
-  var ws, firstPrice = null;
+  let ws, firstPrice = null;
 
   function updateClock() {
-    var d = new Date();
+    let d = new Date();
     document.getElementById('clock').textContent =
       d.toLocaleTimeString('en-US', {timeZone:'Africa/Nairobi', hour12:false});
   }
-  updateClock(); setInterval(updateClock, 1000);
+  updateClock();
+  setInterval(updateClock, 1000);
 
   function fmt(n) {
     if (n == null || n === 0) return '--';
-    return '$' + Number(n).toLocaleString('en-US',
-      {minimumFractionDigits:2, maximumFractionDigits:2});
+    return '$' + Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2});
   }
 
   function connect() {
-    var wsUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws';
+    const wsUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws';
     ws = new WebSocket(wsUrl);
-    ws.onopen  = function() {
+    ws.onopen = function() {
       document.getElementById('ws-dot').className = 'dot dot-ok';
       document.getElementById('ws-txt').textContent = 'Live';
     };
@@ -637,30 +533,29 @@ HTML_CONTENT = """<!DOCTYPE html>
   function handleState(d) {
     if (d.type === 'ping') return;
 
-    var p = d.price;
+    let p = d.price;
     if (p && p > 0) {
       document.getElementById('live-price').textContent = fmt(p);
       if (firstPrice === null) firstPrice = p;
-      var chg = p - firstPrice;
-      var pct = (chg / firstPrice * 100).toFixed(2);
-      var chgEl = document.getElementById('price-change');
+      let chg = p - firstPrice;
+      let pct = (chg / firstPrice * 100).toFixed(2);
+      let chgEl = document.getElementById('price-change');
       chgEl.textContent = (chg >= 0 ? '+' : '') + fmt(chg) + ' (' + pct + '%)';
       chgEl.style.color = chg >= 0 ? '#00E5A0' : '#FF4560';
     }
 
-    var sig  = d.signal || 'HOLD';
-    var isUp = sig === 'UP', isDn = sig === 'DOWN';
-    var col  = isUp ? '#00E5A0' : isDn ? '#FF4560' : '#4A6080';
+    let sig = d.signal || 'HOLD';
+    let isUp = sig === 'UP', isDn = sig === 'DOWN';
+    let col = isUp ? '#00E5A0' : isDn ? '#FF4560' : '#4A6080';
     document.getElementById('pred-arrow').textContent = isUp ? '▲' : isDn ? '▼' : '◆';
     document.getElementById('pred-arrow').style.color = col;
-    document.getElementById('pred-dir').textContent   = isUp ? 'UP' : isDn ? 'DOWN' : 'HOLD';
-    document.getElementById('pred-dir').style.color   = col;
-    document.getElementById('conf-pct').textContent   = (isUp||isDn) ? d.confidence+'%' : '--%';
-    document.getElementById('conf-pct').style.color   = col;
-    document.getElementById('conf-bar').style.width   = (d.confidence||0) + '%';
+    document.getElementById('pred-dir').textContent = isUp ? 'UP' : isDn ? 'DOWN' : 'HOLD';
+    document.getElementById('pred-dir').style.color = col;
+    document.getElementById('conf-pct').textContent = (isUp||isDn) ? d.confidence+'%' : '--%';
+    document.getElementById('conf-pct').style.color = col;
+    document.getElementById('conf-bar').style.width = (d.confidence||0) + '%';
     document.getElementById('conf-bar').style.background = col;
-    document.getElementById('pred-window').textContent =
-      d.next_window ? 'Next: ' + d.next_window : '';
+    document.getElementById('pred-window').textContent = d.next_window ? 'Next: ' + d.next_window : '';
 
     if (d.ohlc) {
       document.getElementById('o-open').textContent  = fmt(d.ohlc.open);
@@ -669,40 +564,39 @@ HTML_CONTENT = """<!DOCTYPE html>
       document.getElementById('o-close').textContent = fmt(d.ohlc.close);
     }
 
-    var w = d.wins||0, l = d.losses||0, tot = w+l;
+    let w = d.wins||0, l = d.losses||0, tot = w+l;
     document.getElementById('p-wins').textContent   = w;
     document.getElementById('p-losses').textContent = l;
     document.getElementById('p-acc').textContent    = tot ? (w/tot*100).toFixed(1)+'%' : '--%';
 
-    var msEl = document.getElementById('model-status');
+    let msEl = document.getElementById('model-status');
     if (d.model_ready) {
-      msEl.textContent = '&#10003; Model active';
-      msEl.style.color = '#00E5A0';
+      msEl.textContent  = '✓ Model active';
+      msEl.style.color  = '#00E5A0';
     } else {
-      msEl.textContent = '&#8987; Collecting data...';
-      msEl.style.color = '#F7931A';
+      msEl.textContent  = '⏳ Collecting data...';
+      msEl.style.color  = '#F7931A';
     }
 
-    var tbody = document.getElementById('history-body');
+    let tbody = document.getElementById('history-body');
     if (d.table && d.table.length) {
-      tbody.innerHTML = d.table.map(function(r) {
-        var predCls = r.predicted==='UP'?'up':r.predicted==='DOWN'?'down':'';
-        var actCls  = r.actual==='UP'?'up':r.actual==='DOWN'?'down':'';
-        var predTxt = r.predicted==='UP'?'&#9650; UP':r.predicted==='DOWN'?'&#9660; DOWN':r.predicted;
-        var actTxt  = r.actual==='⏳'?'--':r.actual==='UP'?'&#9650; UP':r.actual==='DOWN'?'&#9660; DOWN':r.actual;
-        return '<tr>' +
-          '<td style="color:#4A6080">'   + r.window      + '</td>' +
-          '<td class="' + predCls + '">' + predTxt       + '</td>' +
-          '<td style="color:#F7931A">'   + r.confidence  + '%</td>' +
-          '<td>'                         + fmt(r.act_open)  + '</td>' +
-          '<td>'                         + fmt(r.act_close) + '</td>' +
-          '<td class="' + actCls + '">'  + actTxt        + '</td>' +
-          '<td>'                         + (r.result==='⏳'?'--':r.result) + '</td>' +
-          '</tr>';
+      tbody.innerHTML = d.table.map(r => {
+        let predCls = r.predicted==='UP'?'up':r.predicted==='DOWN'?'down':'';
+        let actCls  = r.actual==='UP'?'up':r.actual==='DOWN'?'down':'';
+        let predTxt = r.predicted==='UP'?'▲ UP':r.predicted==='DOWN'?'▼ DOWN':r.predicted;
+        let actTxt  = r.actual==='⏳'?'--':r.actual==='UP'?'▲ UP':r.actual==='DOWN'?'▼ DOWN':r.actual;
+        return `<tr>
+          <td style="color:#4A6080">${r.window}</td>
+          <td class="${predCls}">${predTxt}</td>
+          <td style="color:#F7931A">${r.confidence}%</td>
+          <td>${fmt(r.act_open)}</td>
+          <td>${fmt(r.act_close)}</td>
+          <td class="${actCls}">${actTxt}</td>
+          <td>${r.result==='⏳'?'--':r.result}</td>
+        </tr>`;
       }).join('');
     } else {
-      tbody.innerHTML =
-        '<tr><td colspan="7" style="text-align:center;padding:20px;">Waiting for data...</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:20px;">Waiting for data...</td></tr>';
     }
   }
 
@@ -718,9 +612,9 @@ HTML_CONTENT = """<!DOCTYPE html>
 async def lifespan(application: FastAPI):
     global _main_loop, _clients_lock
     _main_loop    = asyncio.get_running_loop()
-    _clients_lock = asyncio.Lock()          # created inside running loop
+    _clients_lock = asyncio.Lock()
 
-    # Warm-start: synthetic candles + first model train
+    # Warm-start
     synth = generate_synthetic_history()
     with state_lock:
         for c in synth:
@@ -731,27 +625,26 @@ async def lifespan(application: FastAPI):
         daemon=True, name="initial-train",
     ).start()
 
-    # Background threads
-    threading.Thread(target=tradingview_ws_thread,  name="tv-ws",     daemon=True).start()
+    # Price processor thread
     threading.Thread(target=price_processor_thread, name="price-proc", daemon=True).start()
+
+    # Binance in its own plain daemon thread (no anyio)
+    threading.Thread(target=_binance_thread, name="binance-ws", daemon=True).start()
 
     # Async broadcast task
     asyncio.create_task(_periodic_broadcast())
 
     logger.info("=" * 54)
-    logger.info("BTC Predictor ready  —  TradingView live feed active")
-    logger.info(f"Symbol: {TV_SYMBOL}")
+    logger.info("BTC Predictor ready — Binance live feed + TradingView chart")
+    logger.info(f"Chart Symbol: {TV_CHART_SYMBOL}")
     logger.info("=" * 54)
     yield
 
-
 app = FastAPI(lifespan=lifespan)
-
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return HTML_CONTENT
-
 
 @app.websocket("/ws")
 async def ws_endpoint(websocket: WebSocket):
@@ -763,7 +656,7 @@ async def ws_endpoint(websocket: WebSocket):
         await websocket.send_text(json.dumps(_build_state_payload()))
         while True:
             await asyncio.sleep(20)
-            await websocket.send_text(json.dumps({"type": "ping"}))   # Render keepalive
+            await websocket.send_text(json.dumps({"type": "ping"}))
     except WebSocketDisconnect:
         pass
     except Exception:
@@ -773,7 +666,6 @@ async def ws_endpoint(websocket: WebSocket):
             if websocket in _clients:
                 _clients.remove(websocket)
         logger.info(f"WS client disconnected — total: {len(_clients)}")
-
 
 # ============================================================
 # ENTRY POINT
