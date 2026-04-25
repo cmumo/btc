@@ -655,18 +655,28 @@ async def ws_endpoint(websocket: WebSocket):
     try:
         # Send current state immediately on connect
         await websocket.send_text(json.dumps(_build_state_payload()))
-        # Keep alive: actively receive frames with a timeout.
-        # Render's HTTP proxy kills idle WebSockets after ~55s.
-        # On TimeoutError we send a ping to satisfy the proxy.
+        # Keep-alive loop.
+        # Use websocket.receive() (not receive_text) so binary frames and
+        # proxy-level pings don't raise an exception and kill the connection.
+        # Send a keepalive every 25s so Render's ~55s idle proxy timeout
+        # never triggers.
         while True:
             try:
-                data = await asyncio.wait_for(websocket.receive_text(), timeout=25.0)
-                if data == "ping":
+                msg = await asyncio.wait_for(websocket.receive(), timeout=25.0)
+                if msg.get("type") == "websocket.disconnect":
+                    break
+                text = msg.get("text")
+                if text == "ping":
                     await websocket.send_text(json.dumps({"type": "pong"}))
             except asyncio.TimeoutError:
-                await websocket.send_text(json.dumps({"type": "ping"}))
-    except WebSocketDisconnect:
-        pass
+                try:
+                    await websocket.send_text(json.dumps({"type": "ping"}))
+                except Exception:
+                    break
+            except WebSocketDisconnect:
+                break
+            except Exception:
+                break
     except Exception:
         pass
     finally:
