@@ -1,6 +1,10 @@
 services:
   - type: web
     name: btc-predictor
-    runtime: image
-    repo: https://github.com/cmumo/btc
+    runtime: docker              # Changed from 'image' or 'python' to 'docker'
+    repo: https://github.com/YOUR_USERNAME/YOUR_REPO  # Replace with your actual repo URL
     plan: free
+    dockerfilePath: ./Dockerfile  # Explicitly point to your Dockerfile
+    envVars:
+      - key: PORT
+        value: 8000
