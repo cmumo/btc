@@ -324,16 +324,20 @@ async def _periodic_broadcast() -> None:
 async def _broadcast_state() -> None:
     payload = _build_state_payload()
     msg     = json.dumps(payload)
+    # Snapshot clients first — never hold the lock during async sends
     async with _clients_lock:
-        dead = []
-        for ws in list(_clients):
-            try:
-                await ws.send_text(msg)
-            except Exception:
-                dead.append(ws)
-        for ws in dead:
-            if ws in _clients:
-                _clients.remove(ws)
+        snapshot = list(_clients)
+    dead = []
+    for ws in snapshot:
+        try:
+            await ws.send_text(msg)
+        except Exception:
+            dead.append(ws)
+    if dead:
+        async with _clients_lock:
+            for ws in dead:
+                if ws in _clients:
+                    _clients.remove(ws)
 
 def _build_state_payload() -> dict:
     with state_lock:
@@ -653,10 +657,20 @@ async def ws_endpoint(websocket: WebSocket):
         _clients.append(websocket)
     logger.info(f"WS client connected — total: {len(_clients)}")
     try:
+        # Send initial state immediately
         await websocket.send_text(json.dumps(_build_state_payload()))
+        # Keep alive by draining any incoming frames (pings/pongs/close)
+        # The _periodic_broadcast task handles all outgoing sends
         while True:
-            await asyncio.sleep(20)
-            await websocket.send_text(json.dumps({"type": "ping"}))
+            try:
+                # Wait for any incoming message with a timeout
+                data = await asyncio.wait_for(websocket.receive_text(), timeout=25.0)
+                # If client sends a ping, reply with pong
+                if data == "ping":
+                    await websocket.send_text(json.dumps({"type": "pong"}))
+            except asyncio.TimeoutError:
+                # Send keepalive ping to prevent Render proxy timeout
+                await websocket.send_text(json.dumps({"type": "ping"}))
     except WebSocketDisconnect:
         pass
     except Exception:
