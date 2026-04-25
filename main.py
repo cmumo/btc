@@ -1,7 +1,7 @@
 """
 Bitcoin 5-Minute Prediction Terminal
 =====================================
-- TradingView chart (BITSTAMP:BTCUSD) + Binance WebSocket for live prices
+- TradingView chart (BITSTAMP:BTCUSD) + Coinbase WebSocket for live prices
 - XGBoost model, 5-min candles, win/loss tracking
 - GMT+3 timezone, prices with 2 decimal places
 - Render-compatible: plain daemon threads, no anyio, correct $PORT binding
@@ -236,35 +236,43 @@ def _close_current_window_locked() -> None:
         ).start()
 
 # ============================================================
-# BINANCE WEBSOCKET — plain daemon thread, NO anyio
+# COINBASE WEBSOCKET — No geographic restrictions, reliable price feed
 # ============================================================
-def _binance_thread() -> None:
-    url         = "wss://stream.binance.com:9443/ws/btcusdt@trade"
+def _coinbase_thread() -> None:
+    url = "wss://ws-feed.exchange.coinbase.com"
     retry_delay = 2
+    
     while True:
-        logger.info("Connecting to Binance WebSocket...")
+        logger.info("Connecting to Coinbase WebSocket...")
         try:
             def on_open(ws_obj):
                 nonlocal retry_delay
                 retry_delay = 2
-                logger.info("Binance WS connected")
+                # Subscribe to BTC-USD trades
+                subscribe_msg = json.dumps({
+                    "type": "subscribe",
+                    "product_ids": ["BTC-USD"],
+                    "channels": ["matches"]
+                })
+                ws_obj.send(subscribe_msg)
+                logger.info("Coinbase WS connected - receiving BTC-USD trades")
 
             def on_message(ws_obj, raw):
                 try:
                     data = json.loads(raw)
-                    if data.get("e") == "trade":
+                    if data.get("type") == "match":
                         price_queue.put_nowait({
-                            "price": float(data["p"]),
-                            "ts":    float(data["T"]) / 1000.0,
+                            "price": float(data["price"]),
+                            "ts":    time.time(),
                         })
                 except Exception:
                     pass
 
             def on_error(ws_obj, err):
-                logger.error(f"Binance WS error: {err}")
+                logger.error(f"Coinbase WS error: {err}")
 
             def on_close(ws_obj, code, msg):
-                logger.warning("Binance WS closed")
+                logger.warning("Coinbase WS closed")
 
             app_ws = ws_client.WebSocketApp(
                 url,
@@ -275,9 +283,9 @@ def _binance_thread() -> None:
             )
             app_ws.run_forever(ping_interval=20, ping_timeout=10)
         except Exception as exc:
-            logger.error(f"Binance thread exception: {exc}")
+            logger.error(f"Coinbase thread exception: {exc}")
 
-        logger.warning(f"Binance WS reconnecting in {retry_delay}s...")
+        logger.warning(f"Coinbase WS reconnecting in {retry_delay}s...")
         time.sleep(retry_delay)
         retry_delay = min(retry_delay * 2, 60)
 
@@ -348,7 +356,7 @@ def _build_state_payload() -> dict:
     }
 
 # ============================================================
-# HTML FRONTEND  (original sidebar design)
+# HTML FRONTEND (updated: larger card titles + white clock)
 # ============================================================
 HTML_CONTENT = """<!DOCTYPE html>
 <html lang="en">
@@ -363,6 +371,7 @@ HTML_CONTENT = """<!DOCTYPE html>
   .header{margin-bottom:10px;}
   .header h1{font-size:1.2rem;font-weight:700;color:#F7931A;letter-spacing:.04em;}
   .status-bar{display:flex;align-items:center;gap:10px;margin-bottom:12px;font-size:.8rem;color:#4A6080;}
+  .status-bar #clock-gmt3{color:#FFFFFF;}  /* White clock text */
   .dot{width:8px;height:8px;border-radius:50%;display:inline-block;flex-shrink:0;}
   .dot-ok{background:#00E5A0;box-shadow:0 0 6px #00E5A0;}
   .dot-bad{background:#FF4560;}
@@ -373,7 +382,7 @@ HTML_CONTENT = """<!DOCTYPE html>
   #tv-chart{background:#0D1421;border-radius:10px;border:1px solid #1E2D45;height:380px;overflow:hidden;}
   .sidebar{display:flex;flex-direction:column;gap:12px;}
   .card{background:#0D1421;border:1px solid #1E2D45;border-radius:10px;padding:14px;}
-  .card-title{font-size:.68rem;color:#4A6080;text-transform:uppercase;letter-spacing:.1em;margin-bottom:8px;}
+  .card-title{font-size:.85rem;color:#4A6080;text-transform:uppercase;letter-spacing:.1em;margin-bottom:8px;}  /* Increased from .68rem to .85rem */
   .price{font-size:2rem;font-weight:700;color:#F7931A;}
   .pchange{font-size:.82rem;margin-left:6px;}
   .pred-row{display:flex;align-items:center;gap:12px;margin-top:4px;}
@@ -519,7 +528,7 @@ HTML_CONTENT = """<!DOCTYPE html>
     ws=new WebSocket(wsUrl);
     ws.onopen=function(){
       document.getElementById('ws-dot').className='dot dot-ok';
-      document.getElementById('ws-txt').textContent='Live';
+      document.getElementById('ws-txt').textContent='Live (Coinbase)';
     };
     ws.onclose=function(){
       document.getElementById('ws-dot').className='dot dot-bad';
@@ -629,15 +638,15 @@ async def lifespan(application: FastAPI):
     # Price processor thread
     threading.Thread(target=price_processor_thread, name="price-proc", daemon=True).start()
 
-    # Binance: plain daemon thread — keeps asyncio event loop completely free
-    threading.Thread(target=_binance_thread, name="binance-ws", daemon=True).start()
+    # Coinbase WebSocket thread (replaces Binance)
+    threading.Thread(target=_coinbase_thread, name="coinbase-ws", daemon=True).start()
 
     # Periodic broadcast to all connected WebSocket clients
     asyncio.create_task(_periodic_broadcast())
 
     port = os.environ.get("PORT", "8000")
     logger.info("=" * 52)
-    logger.info(f"BTC Predictor ready — port {port}")
+    logger.info(f"BTC Predictor ready — Coinbase live feed — port {port}")
     logger.info("=" * 52)
     yield
 
@@ -657,10 +666,6 @@ async def ws_endpoint(websocket: WebSocket):
         # Send current state immediately on connect
         await websocket.send_text(json.dumps(_build_state_payload()))
         # Keep-alive loop.
-        # Use websocket.receive() (not receive_text) so binary frames and
-        # proxy-level pings don't raise an exception and kill the connection.
-        # Send a keepalive every 25s so Render's ~55s idle proxy timeout
-        # never triggers.
         while True:
             try:
                 msg = await asyncio.wait_for(websocket.receive(), timeout=25.0)
@@ -689,13 +694,6 @@ async def ws_endpoint(websocket: WebSocket):
 # ============================================================
 # ENTRY POINT
 # ============================================================
-# ============================================================
-# ENTRY POINT — works both via `python main.py` and
-# `uvicorn main:app` (Render's default start command).
-# When Render calls uvicorn directly it passes --port via
-# the $PORT env var using its own CLI, so we also read it
-# here as a fallback for `python main.py` usage.
-# ============================================================
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
@@ -703,6 +701,6 @@ if __name__ == "__main__":
         "main:app",
         host="0.0.0.0",
         port=port,
-        ws="websockets",        # explicit WebSocket backend for Render
+        ws="websockets",
         log_level="info",
     )
