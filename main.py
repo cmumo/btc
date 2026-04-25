@@ -1115,7 +1115,7 @@ HTML_CONTENT = """<!DOCTYPE html>
   </div>
 
   <div class="card">
-    <div class="card-title">Prediction History (Current to Oldest)</div>
+    <div class="card-title">Prediction History (Last 5)</div>
     <div class="table-wrapper">
       <table>
         <thead>
