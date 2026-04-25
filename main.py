@@ -599,9 +599,266 @@ def _build_state_payload() -> dict:
     }
 
 # ============================================================
-# HTML FRONTEND (same as before - omitted for brevity)
+# HTML FRONTEND
 # ============================================================
-# [Your existing HTML_CONTENT here - unchanged]
+HTML_CONTENT = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BTC 5-Min Predictor</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#080C14;color:#C8D8EF;font-family:'Segoe UI',sans-serif;min-height:100vh;}
+  .container{max-width:1280px;margin:0 auto;padding:14px;}
+  .header{margin-bottom:10px;}
+  .header h1{font-size:1.2rem;font-weight:700;color:#F7931A;letter-spacing:.04em;}
+  .status-bar{display:flex;align-items:center;gap:10px;margin-bottom:12px;font-size:.8rem;color:#4A6080;}
+  .status-bar #clock-gmt3{color:#FFFFFF;}
+  .dot{width:8px;height:8px;border-radius:50%;display:inline-block;flex-shrink:0;}
+  .dot-ok{background:#00E5A0;box-shadow:0 0 6px #00E5A0;}
+  .dot-bad{background:#FF4560;}
+  .dot-wait{background:#F7931A;animation:pulse 1.2s infinite;}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+  .main-grid{display:grid;grid-template-columns:1fr 340px;gap:14px;margin-bottom:14px;align-items:stretch;}
+  #tv-chart{background:#0D1421;border-radius:10px;border:1px solid #1E2D45;height:380px;overflow:hidden;}
+  .sidebar{display:flex;flex-direction:column;gap:12px;}
+  .sidebar .card:first-child {flex:0 0 auto;}
+  .sidebar .card:nth-child(2) {flex:1;display:flex;flex-direction:column;justify-content:center;}
+  .sidebar .card:nth-child(3) {flex:0 0 auto;}
+  .card{background:#0D1421;border:1px solid #1E2D45;border-radius:10px;padding:14px;}
+  .card-title{font-size:.85rem;color:#4A6080;text-transform:uppercase;letter-spacing:.1em;margin-bottom:8px;}
+  .price{font-size:2rem;font-weight:700;color:#F7931A;}
+  .pchange{font-size:.82rem;margin-left:6px;}
+  .pred-row{display:flex;align-items:center;gap:12px;margin-top:4px;}
+  .pred-arrow{font-size:2.4rem;line-height:1;}
+  .pred-dir{font-size:1.3rem;font-weight:700;}
+  .conf-bar{background:#1E2D45;border-radius:4px;height:6px;margin-top:8px;overflow:hidden;}
+  .conf-fill{height:100%;width:0%;transition:width 0.4s ease;}
+  .countdown{display:flex;align-items:center;gap:14px;}
+  .cd-ring{width:58px;height:58px;transform:rotate(-90deg);}
+  .cd-text{font-size:1.8rem;font-weight:700;color:#F7931A;}
+  .bottom-row{display:grid;gap:14px;grid-template-columns:1fr 1fr;margin-bottom:14px;}
+  @media(max-width:600px){.bottom-row{grid-template-columns:1fr;}}
+  .ohlc-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:6px;}
+  .ohlc-cell{background:#0F1623;border-radius:6px;padding:7px 10px;border:1px solid #1E2D45;}
+  .ohlc-cell .lbl{font-size:.6rem;color:#4A6080;}
+  .ohlc-cell .val{font-size:.88rem;font-weight:700;margin-top:2px;}
+  .perf-row{display:flex;gap:10px;margin-top:8px;}
+  .perf-stat{flex:1;text-align:center;background:#0F1623;border-radius:7px;padding:8px;border:1px solid #1E2D45;}
+  .perf-num{font-size:1.35rem;font-weight:700;}
+  .perf-lbl{font-size:.6rem;color:#4A6080;margin-top:2px;}
+  .table-wrapper{overflow-x:auto;margin-top:10px;}
+  table{width:100%;border-collapse:collapse;font-size:.75rem;}
+  th,td{padding:8px;text-align:left;border-bottom:1px solid #1E2D45;}
+  th{color:#4A6080;font-weight:600;}
+  .up{color:#00E5A0;}.down{color:#FF4560;}
+  .disclaimer{background:#0F1623;border-radius:8px;padding:10px;font-size:.7rem;text-align:center;color:#FACC15;border:1px solid rgba(250,204,21,.13);margin-top:14px;}
+  .flash-up{animation:flashUp .4s ease;}.flash-dn{animation:flashDn .4s ease;}
+  @keyframes flashUp{0%,100%{color:#C8D8EF}50%{color:#00E5A0}}
+  @keyframes flashDn{0%,100%{color:#C8D8EF}50%{color:#FF4560}}
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header"><h1>&#x20BF; Bitcoin Price Trend Predictor</h1></div>
+  <div class="status-bar">
+    <div class="dot dot-wait" id="ws-dot"></div>
+    <span id="ws-txt">Connecting...</span>
+    <span id="clock-gmt3">--:--:-- GMT+3</span>
+  </div>
+
+  <div class="main-grid">
+    <div id="tv-chart"><div id="tv-widget" style="width:100%;height:100%"></div></div>
+    <div class="sidebar">
+      <div class="card">
+        <div class="card-title">Live BTC / USD</div>
+        <div><span class="price" id="price-val">$---.--</span><span class="pchange" id="price-change">--</span></div>
+      </div>
+      <div class="card">
+        <div class="card-title">Next 5-Min Prediction</div>
+        <div class="pred-row">
+          <span class="pred-arrow" id="pred-arrow" style="color:#4A6080">&#x25C6;</span>
+          <span class="pred-dir" id="pred-dir" style="color:#4A6080">HOLD</span>
+          <span id="conf-pct" style="font-size:.85rem;color:#4A6080">--%</span>
+        </div>
+        <div class="conf-bar"><div class="conf-fill" id="conf-bar"></div></div>
+        <div id="pred-window" style="margin-top:6px;font-size:.7rem;color:#4A6080;"></div>
+      </div>
+      <div class="card">
+        <div class="card-title">Next window opens in</div>
+        <div class="countdown">
+          <svg class="cd-ring" viewBox="0 0 72 72">
+            <circle cx="36" cy="36" r="32" stroke="#1E2D45" stroke-width="5" fill="none"/>
+            <circle cx="36" cy="36" r="32" stroke="#F7931A" stroke-width="5" fill="none"
+              stroke-dasharray="201" stroke-dashoffset="201" id="cd-ring" stroke-linecap="round"/>
+          </svg>
+          <div class="cd-text" id="cd-val">5:00</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="bottom-row">
+    <div class="card">
+      <div class="card-title">Current Window</div>
+      <div class="ohlc-grid">
+        <div class="ohlc-cell"><div class="lbl">Open</div><div class="val" id="o-open">--</div></div>
+        <div class="ohlc-cell"><div class="lbl">High</div><div class="val up" id="o-high">--</div></div>
+        <div class="ohlc-cell"><div class="lbl">Low</div><div class="val down" id="o-low">--</div></div>
+        <div class="ohlc-cell"><div class="lbl">Close</div><div class="val" id="o-close">--</div></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title">Performance</div>
+      <div class="perf-row">
+        <div class="perf-stat"><div class="perf-num up" id="p-wins">0</div><div class="perf-lbl">Wins</div></div>
+        <div class="perf-stat"><div class="perf-num down" id="p-losses">0</div><div class="perf-lbl">Losses</div></div>
+        <div class="perf-stat"><div class="perf-num" id="p-acc" style="color:#F7931A">--%</div><div class="perf-lbl">Accuracy</div></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Prediction History (last 5)</div>
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>Window</th><th>Prediction</th><th>Conf</th><th>Act.Open</th><th>Act.Close</th><th>Actual</th><th>Result</th></tr></thead>
+        <tbody id="history-body"><tr><td colspan="7" style="text-align:center;padding:20px;">Waiting for data...</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="disclaimer">&#x26A0;&#xFE0F; For educational purposes only. Past accuracy does not guarantee future results.</div>
+</div>
+
+<script src="https://s3.tradingview.com/tv.js"></script>
+<script>
+  new TradingView.widget({
+    container_id:'tv-widget',symbol:'BITSTAMP:BTCUSD',interval:'5',
+    theme:'dark',style:'1',locale:'en',toolbar_bg:'#080C14',
+    enable_publishing:false,autosize:true
+  });
+
+  let ws, firstPrice=null, prevPrice=null;
+
+  function updateClock(){
+    const d=new Date();
+    document.getElementById('clock-gmt3').textContent=
+      d.toLocaleTimeString('en-US',{timeZone:'Africa/Nairobi',hour12:false})+' GMT+3';
+  }
+  updateClock(); setInterval(updateClock,1000);
+
+  function updateCountdown(){
+    const now=new Date();
+    const gmt3=new Date(now.getTime()+3*3600000);
+    const sec=gmt3.getUTCSeconds()+gmt3.getUTCMinutes()%5*60;
+    const remaining=300-sec%300;
+    const mm=Math.floor(remaining/60);
+    const ss=String(remaining%60).padStart(2,'0');
+    document.getElementById('cd-val').textContent=mm+':'+ss;
+    const circ=201;
+    document.getElementById('cd-ring').setAttribute('stroke-dashoffset',
+      String(circ*(1-(remaining/300))));
+  }
+  updateCountdown(); setInterval(updateCountdown,1000);
+
+  function fmt(n){
+    if(n==null||n===0)return'--';
+    return'$'+Number(n).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
+  }
+
+  function connect(){
+    const wsUrl=(location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws';
+    ws=new WebSocket(wsUrl);
+    ws.onopen=function(){
+      document.getElementById('ws-dot').className='dot dot-ok';
+      document.getElementById('ws-txt').textContent='Live (Coinbase)';
+    };
+    ws.onclose=function(){
+      document.getElementById('ws-dot').className='dot dot-bad';
+      document.getElementById('ws-txt').textContent='Disconnected';
+      setTimeout(connect,3000);
+    };
+    ws.onerror=function(){
+      document.getElementById('ws-dot').className='dot dot-bad';
+    };
+    ws.onmessage=function(e){
+      try{handleState(JSON.parse(e.data));}catch(err){}
+    };
+  }
+
+  function handleState(d){
+    if(d.type==='ping')return;
+
+    const p=d.price;
+    if(p&&p>0){
+      const priceEl=document.getElementById('price-val');
+      if(prevPrice!==null){
+        priceEl.className='price '+(p>prevPrice?'flash-up':p<prevPrice?'flash-dn':'');
+        setTimeout(function(){priceEl.className='price';},400);
+      }
+      priceEl.textContent=fmt(p);
+      prevPrice=p;
+      if(firstPrice===null)firstPrice=p;
+      const chg=p-firstPrice;
+      const pct=(chg/firstPrice*100).toFixed(2);
+      const chgEl=document.getElementById('price-change');
+      chgEl.textContent=(chg>=0?'+':'')+fmt(chg)+' ('+pct+'%)';
+      chgEl.style.color=chg>=0?'#00E5A0':'#FF4560';
+    }
+
+    const sig=d.signal||'HOLD';
+    const isUp=sig==='UP',isDn=sig==='DOWN';
+    const col=isUp?'#00E5A0':isDn?'#FF4560':'#4A6080';
+    document.getElementById('pred-arrow').textContent=isUp?'\u25b2':isDn?'\u25bc':'\u25c6';
+    document.getElementById('pred-arrow').style.color=col;
+    document.getElementById('pred-dir').textContent=isUp?'UP':isDn?'DOWN':'HOLD';
+    document.getElementById('pred-dir').style.color=col;
+    document.getElementById('conf-pct').textContent=(isUp||isDn)?d.confidence+'%':'--%';
+    document.getElementById('conf-pct').style.color=col;
+    document.getElementById('conf-bar').style.width=(d.confidence||0)+'%';
+    document.getElementById('conf-bar').style.background=col;
+    document.getElementById('pred-window').textContent=d.next_window?'Next: '+d.next_window:'';
+
+    if(d.ohlc){
+      document.getElementById('o-open').textContent=fmt(d.ohlc.open);
+      document.getElementById('o-high').textContent=fmt(d.ohlc.high);
+      document.getElementById('o-low').textContent=fmt(d.ohlc.low);
+      document.getElementById('o-close').textContent=fmt(d.ohlc.close);
+    }
+
+    const w=d.wins||0,l=d.losses||0,tot=w+l;
+    document.getElementById('p-wins').textContent=w;
+    document.getElementById('p-losses').textContent=l;
+    document.getElementById('p-acc').textContent=tot?(w/tot*100).toFixed(1)+'%':'--%';
+
+    const tbody=document.getElementById('history-body');
+    if(d.table&&d.table.length){
+      tbody.innerHTML=d.table.map(function(r){
+        const predCls=r.predicted==='UP'?'up':r.predicted==='DOWN'?'down':'';
+        const actCls=r.actual==='UP'?'up':r.actual==='DOWN'?'down':'';
+        const predTxt=r.predicted==='UP'?'\u25b2 UP':r.predicted==='DOWN'?'\u25bc DOWN':r.predicted;
+        const actTxt=r.actual==='\u23f3'?'--':r.actual==='UP'?'\u25b2 UP':r.actual==='DOWN'?'\u25bc DOWN':r.actual;
+        return '<tr>'
+          +'<td style="color:#4A6080">'+r.window+'</td>'
+          +'<td class="'+predCls+'">'+predTxt+'</td>'
+          +'<td style="color:#F7931A">'+r.confidence+'%</td>'
+          +'<td>'+fmt(r.act_open)+'</td>'
+          +'<td>'+fmt(r.act_close)+'</td>'
+          +'<td class="'+actCls+'">'+actTxt+'</td>'
+          +'<td>'+(r.result==='\u23f3'?'--':r.result)+'</td>'
+          +'</tr>';
+      }).join('');
+    }else{
+      tbody.innerHTML='<tr><td colspan="7" style="text-align:center;padding:20px;">Waiting for data...</td></tr>';
+    }
+  }
+
+  connect();
+</script>
+</body>
+</html>"""
 
 # ============================================================
 # FASTAPI APPLICATION
@@ -647,7 +904,7 @@ async def lifespan(application: FastAPI):
         with state_lock:
             for c in synth:
                 completed_candles.append(c)
-                save_candle(c)  # Save synthetic candles too
+                save_candle(c)
         threading.Thread(
             target=train_model_from_candles,
             args=(list(completed_candles),),
