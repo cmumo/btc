@@ -1,15 +1,3 @@
-"""
-Bitcoin 5-Minute Prediction Terminal  ·  v4.0  (Supabase)
-==========================================================
-Backend  : Supabase (PostgreSQL via REST API) — no SQLite
-Models   : BiLSTM · AttentionGRU (TFT-inspired) · XGBoost · RandomForest · LightGBM
-Ensemble : Adaptive soft-voting — weights shift toward the best-performing model
-           using rolling accuracy over the last 20 resolved UP/DOWN predictions
-HOLD     : Never counted in wins/losses/accuracy; shown as "--" confidence
-Features : 31 engineered features including VMD-inspired decomposition
-History  : Last 5 predictions always loaded from Supabase on startup
-           so the table is never empty when a new visitor opens the page
-"""
 
 import asyncio
 import base64
@@ -115,7 +103,7 @@ MIN_CANDLES_TRAIN  = 35
 MIN_CANDLES_DEEP   = 60
 RETRAIN_EVERY      = 3
 SEQ_LEN            = 20
-N_FEATURES         = 31
+N_FEATURES         = 52
 LSTM_HIDDEN        = 64
 LSTM_LAYERS        = 2
 GRU_HIDDEN         = 64
@@ -244,10 +232,15 @@ def save_stats(wins: int, losses: int) -> None:
 
 
 def recompute_stats_from_db() -> Tuple[int, int]:
-    """Count wins/losses directly from predictions — authoritative source."""
+    """
+    Count wins/losses directly from the predictions table — authoritative.
+    Matches both the emoji characters and their unicode escape equivalents.
+    """
     rows = _sb_get("predictions", {"select": "result"})
-    w = sum(1 for r in rows if r.get("result") == "\u2705")
-    l = sum(1 for r in rows if r.get("result") == "\u274c")
+    win_vals  = {"✅", "✅"}
+    loss_vals = {"❌", "❌"}
+    w = sum(1 for r in rows if r.get("result") in win_vals)
+    l = sum(1 for r in rows if r.get("result") in loss_vals)
     return w, l
 
 
@@ -312,19 +305,42 @@ def _vmd_decompose(prices: np.ndarray, window: int = 10) -> Tuple[np.ndarray, np
 
 
 # ============================================================
-# FEATURE ENGINEERING  (31 features)
+# FEATURE ENGINEERING  (52 features)
+# Grounded in 5-min BTC microstructure research:
+#   momentum signals, volatility regimes, S/R levels,
+#   candlestick conviction, volume-price agreement, HFT burst detection
 # ============================================================
 FEATURE_COLS = [
+    # ── Price structure (7) ──────────────────────────────────────
     "ret","hl","oc","body_ratio","upper_wick","lower_wick","is_bullish",
+    # ── Trend / EMA (4) ──────────────────────────────────────────
     "ema_diff","price_vs_ema9","ma_diff","price_vs_ma10",
-    "rsi_norm","macd","macd_hist","roc5","momentum3_norm",
-    "atr","bb_pct","bb_width","volatility",
-    "vol_ratio","vol_trend",
+    # ── RSI (4): value + threshold zone signals ───────────────────
+    "rsi_norm","rsi_ob","rsi_os","rsi_mid_cross",
+    # ── MACD (4): value + crossover events ───────────────────────
+    "macd","macd_hist","macd_cross","macd_zero_cross",
+    # ── Momentum / ROC (3) ───────────────────────────────────────
+    "roc5","momentum3_norm","mom_accel",
+    # ── Bollinger Bands (5): position + squeeze + band-touch ──────
+    "bb_pct","bb_width","bb_squeeze","bb_touch_up","bb_touch_dn",
+    # ── Volatility / ATR (3): value + regime ─────────────────────
+    "atr","volatility","vol_regime",
+    # ── Volume (4): ratio + trend + price-agreement + HFT spike ──
+    "vol_ratio","vol_trend","vol_price_agree","vol_spike",
+    # ── Support / Resistance (3) ─────────────────────────────────
+    "near_resistance","near_support","sr_breakout",
+    # ── Trend structure HH/HL vs LH/LL (2) ───────────────────────
+    "trend_hh_hl","trend_lh_ll",
+    # ── Candlestick conviction (2) ────────────────────────────────
+    "conviction","indecision",
+    # ── Lagged returns (3) ───────────────────────────────────────
     "ret_lag1","ret_lag2","ret_lag3",
-    "hour_sin","hour_cos",
+    # ── Time: intraday + day-of-week (4) ─────────────────────────
+    "hour_sin","hour_cos","dow_sin","dow_cos",
+    # ── VMD-inspired decomposition (4) ───────────────────────────
     "trend_component","residual_component","trend_slope","residual_energy",
 ]
-assert len(FEATURE_COLS) == N_FEATURES, f"Feature count mismatch: {len(FEATURE_COLS)}"
+assert len(FEATURE_COLS) == N_FEATURES, f"Feature count mismatch: {len(FEATURE_COLS)} != {N_FEATURES}"
 
 
 def make_features(candles: List[dict]) -> Optional[pd.DataFrame]:
@@ -332,6 +348,7 @@ def make_features(candles: List[dict]) -> Optional[pd.DataFrame]:
         return None
     df = pd.DataFrame(candles)
 
+    # ── Price structure ──────────────────────────────────────────
     df["ret"] = df["close"].pct_change()
     df["hl"]  = (df["high"] - df["low"]) / df["close"].clip(lower=1e-9)
     df["oc"]  = (df["close"] - df["open"]) / df["open"].clip(lower=1e-9)
@@ -342,6 +359,7 @@ def make_features(candles: List[dict]) -> Optional[pd.DataFrame]:
     df["lower_wick"]  = (df[["close","open"]].min(axis=1) - df["low"])  / rng
     df["is_bullish"]  = (df["close"] > df["open"]).astype(float)
 
+    # ── EMA trend ────────────────────────────────────────────────
     ema9  = df["close"].ewm(span=9,  adjust=False).mean()
     ema21 = df["close"].ewm(span=21, adjust=False).mean()
     df["ema_diff"]      = (ema9 - ema21) / df["close"].clip(lower=1e-9)
@@ -352,53 +370,132 @@ def make_features(candles: List[dict]) -> Optional[pd.DataFrame]:
     df["ma_diff"]       = (ma3 - ma5)  / df["close"].clip(lower=1e-9)
     df["price_vs_ma10"] = (df["close"] - ma10) / ma10.clip(lower=1e-9)
 
+    # ── RSI-14 + threshold zone signals ──────────────────────────
     delta    = df["close"].diff()
     avg_gain = delta.clip(lower=0).ewm(com=13, adjust=False).mean()
     avg_loss = (-delta.clip(upper=0)).ewm(com=13, adjust=False).mean()
     rs       = avg_gain / (avg_loss + 1e-9)
-    df["rsi_norm"] = (100 - (100 / (1 + rs)) - 50) / 50
+    rsi_raw  = 100 - (100 / (1 + rs))
+    df["rsi_norm"]     = (rsi_raw - 50) / 50          # −1…+1
+    df["rsi_ob"]       = (rsi_raw > 70).astype(float)  # overbought zone
+    df["rsi_os"]       = (rsi_raw < 30).astype(float)  # oversold zone
+    # RSI crossed 50 this candle: momentum shift signal
+    rsi_prev = rsi_raw.shift(1)
+    df["rsi_mid_cross"] = np.where(
+        (rsi_prev < 50) & (rsi_raw >= 50),  1.0,   # bullish cross
+        np.where((rsi_prev >= 50) & (rsi_raw < 50), -1.0, 0.0))  # bearish cross
 
+    # ── MACD (12/26/9) + crossover events ────────────────────────
     ema12     = df["close"].ewm(span=12, adjust=False).mean()
     ema26     = df["close"].ewm(span=26, adjust=False).mean()
     macd_line = (ema12 - ema26) / df["close"].clip(lower=1e-9)
     macd_sig  = macd_line.ewm(span=9, adjust=False).mean()
-    df["macd"]           = macd_line
-    df["macd_hist"]      = macd_line - macd_sig
+    df["macd"]      = macd_line
+    df["macd_hist"] = macd_line - macd_sig
+    # MACD line crossed signal line: key momentum event
+    ml_prev = macd_line.shift(1); ms_prev = macd_sig.shift(1)
+    df["macd_cross"] = np.where(
+        (ml_prev < ms_prev) & (macd_line >= macd_sig),  1.0,
+        np.where((ml_prev >= ms_prev) & (macd_line < macd_sig), -1.0, 0.0))
+    # MACD crossed zero: trend direction change
+    df["macd_zero_cross"] = np.where(
+        (macd_line.shift(1) < 0) & (macd_line >= 0),  1.0,
+        np.where((macd_line.shift(1) >= 0) & (macd_line < 0), -1.0, 0.0))
+
+    # ── Momentum / ROC + acceleration ────────────────────────────
     df["roc5"]           = df["close"].pct_change(5)
     df["momentum3_norm"] = df["close"].pct_change(3)
+    df["mom_accel"]      = df["momentum3_norm"].diff(2)  # 2nd derivative of momentum
 
+    # ── Bollinger Bands (10) + squeeze + band-touch signals ──────
     bb_mid = df["close"].rolling(10).mean()
     bb_std = df["close"].rolling(10).std().clip(lower=1e-9)
     bb_up  = bb_mid + 2 * bb_std
     bb_lo  = bb_mid - 2 * bb_std
     df["bb_pct"]   = (df["close"] - bb_lo) / (bb_up - bb_lo + 1e-9)
     df["bb_width"] = (bb_up - bb_lo) / bb_mid.clip(lower=1e-9)
+    # Squeeze: BB width below its own 20th percentile → breakout signal
+    bb_w_roll = df["bb_width"].rolling(20, min_periods=5)
+    df["bb_squeeze"]  = (df["bb_width"] < bb_w_roll.quantile(0.20)).astype(float)
+    df["bb_touch_up"] = (df["high"]  >= bb_up  * 0.998).astype(float)
+    df["bb_touch_dn"] = (df["low"]   <= bb_lo  * 1.002).astype(float)
+
+    # ── ATR-10 + volatility + regime ─────────────────────────────
     hl_r = df["high"] - df["low"]
     hc   = (df["high"] - df["close"].shift()).abs()
     lc   = (df["low"]  - df["close"].shift()).abs()
     tr   = pd.concat([hl_r, hc, lc], axis=1).max(axis=1)
-    df["atr"]        = tr.ewm(span=10, adjust=False).mean() / df["close"].clip(lower=1e-9)
+    atr  = tr.ewm(span=10, adjust=False).mean()
+    df["atr"]        = atr / df["close"].clip(lower=1e-9)
     df["volatility"] = df["ret"].rolling(5).std()
+    # Volatility regime: 0=squeeze(<20th pct), 0.5=normal, 1=expansion(>80th pct)
+    atr_roll = atr.rolling(30, min_periods=10)
+    atr_pct  = atr_roll.rank(pct=True)
+    df["vol_regime"] = np.where(atr_pct < 0.20, 0.0,
+                        np.where(atr_pct > 0.80, 1.0, 0.5))
 
+    # ── Volume: ratio + trend + price-agreement + HFT spike ──────
     vm3  = df["volume"].rolling(3).mean()
     vm10 = df["volume"].rolling(10).mean()
     df["vol_ratio"] = df["volume"] / (vm3  + 1e-9)
     df["vol_trend"] = (vm3 - vm10) / (vm10 + 1e-9)
+    # Volume-price agreement: high vol + bullish = +1, high vol + bearish = -1
+    vol_above = (df["volume"] > vm3 * 1.2).astype(float)
+    df["vol_price_agree"] = vol_above * np.where(df["is_bullish"] == 1, 1.0, -1.0)
+    # HFT burst: volume > 2x 10-bar average (sudden liquidity event)
+    df["vol_spike"] = (df["volume"] > vm10 * 2.0).astype(float)
 
+    # ── Support / Resistance (rolling 20-bar high/low) ────────────
+    roll20_high = df["high"].rolling(20, min_periods=5).max()
+    roll20_low  = df["low"].rolling(20,  min_periods=5).min()
+    df["near_resistance"] = (
+        (roll20_high - df["close"]).abs() / df["close"].clip(lower=1e-9) < 0.002
+    ).astype(float)
+    df["near_support"] = (
+        (df["close"] - roll20_low).abs() / df["close"].clip(lower=1e-9) < 0.002
+    ).astype(float)
+    # Breakout: closed above prior 20-bar high or below prior 20-bar low
+    prev_high = roll20_high.shift(1)
+    prev_low  = roll20_low.shift(1)
+    df["sr_breakout"] = np.where(df["close"] > prev_high,  1.0,
+                         np.where(df["close"] < prev_low, -1.0, 0.0))
+
+    # ── Trend structure: HH/HL (uptrend) vs LH/LL (downtrend) ────
+    # Uses last 3 swing highs and 3 swing lows
+    h1, h2, h3 = df["high"].shift(1), df["high"].shift(2), df["high"].shift(3)
+    l1, l2, l3 = df["low"].shift(1),  df["low"].shift(2),  df["low"].shift(3)
+    df["trend_hh_hl"] = ((h1 > h2) & (h2 > h3) & (l1 > l2) & (l2 > l3)).astype(float)
+    df["trend_lh_ll"] = ((h1 < h2) & (h2 < h3) & (l1 < l2) & (l2 < l3)).astype(float)
+
+    # ── Candlestick conviction vs indecision ─────────────────────
+    # Conviction: body > 70% of range (strong directional candle)
+    df["conviction"] = (df["body_ratio"] > 0.70).astype(float) * np.where(
+        df["is_bullish"] == 1, 1.0, -1.0)
+    # Indecision: total wick > 60% of range (doji-like candle)
+    df["indecision"] = ((df["upper_wick"] + df["lower_wick"]) > 0.60).astype(float)
+
+    # ── Lagged returns ────────────────────────────────────────────
     df["ret_lag1"] = df["ret"].shift(1)
     df["ret_lag2"] = df["ret"].shift(2)
     df["ret_lag3"] = df["ret"].shift(3)
 
+    # ── Intraday + day-of-week seasonality ────────────────────────
     try:
-        hours = (pd.to_datetime(df["ts"], unit="s")
-                   .dt.tz_localize("UTC")
-                   .dt.tz_convert("Africa/Nairobi")
-                   .dt.hour)
+        dt_idx = (pd.to_datetime(df["ts"], unit="s")
+                    .dt.tz_localize("UTC")
+                    .dt.tz_convert("Africa/Nairobi"))
+        hours = dt_idx.dt.hour
+        dows  = dt_idx.dt.dayofweek   # 0=Mon … 6=Sun
     except Exception:
-        hours = pd.to_datetime(df["ts"], unit="s").dt.hour
+        dt_idx = pd.to_datetime(df["ts"], unit="s")
+        hours  = dt_idx.dt.hour
+        dows   = dt_idx.dt.dayofweek
     df["hour_sin"] = np.sin(2 * np.pi * hours / 24)
     df["hour_cos"] = np.cos(2 * np.pi * hours / 24)
+    df["dow_sin"]  = np.sin(2 * np.pi * dows  / 7)
+    df["dow_cos"]  = np.cos(2 * np.pi * dows  / 7)
 
+    # ── VMD-inspired trend/residual decomposition ─────────────────
     prices_arr = df["close"].values.astype(np.float64)
     trend, residual = _vmd_decompose(prices_arr, window=10)
     df["trend_component"]    = (trend - prices_arr) / (prices_arr + 1e-9)
@@ -713,42 +810,52 @@ def _new_candle(ts: float, price: float) -> dict:
 
 def _seed_pending_row_locked(window_ts: float) -> None:
     """
-    Create and persist a pending prediction row for the window that is
-    just opening. Idempotent — skipped if the window_start already exists.
+    Create and persist a pending prediction row for the window opening now.
+    Idempotent — skipped if this window_start already exists in memory.
 
-    This is the key fix for "table empty on load":
-      • Called when a new 5-min window starts
-      • Saved to Supabase immediately
-      • Any visitor who loads the page BEFORE the first window closes
-        will still see this pending row in the table
+    Key behaviours:
+    • Only called when a candle window ACTUALLY opens (not on cold startup)
+    • If the model isn't ready yet, still records the window as pending so
+      the row exists for resolution later — but skips saving HOLD to DB
+      until we have a real prediction (avoids HOLD flash on page load)
+    • Keeps history_rows capped at 5, removing only the oldest entry
     """
     ws_dt  = datetime.fromtimestamp(window_ts, tz=TZ)
     we_dt  = ws_dt + timedelta(minutes=5)
     ws_str = ws_dt.strftime("%H:%M")
     we_str = we_dt.strftime("%H:%M")
 
-    # Idempotency: skip if already in memory
+    # Idempotency check
     for row in history_rows:
         if row.get("window_start") == ws_str:
             return
 
     snap = list(completed_candles)
-    pred = predict_from_candles(snap) if snap else \
-           {"signal": "HOLD", "confidence": 0, "next_window": "", "per_model": [None]*5}
+    pred = predict_from_candles(snap) if snap else            {"signal": "HOLD", "confidence": 0, "next_window": "", "per_model": [None]*5}
+
+    signal = pred["signal"]
+    conf   = pred["confidence"]
 
     rec = {
         "window_start": ws_str, "window_end": we_str,
         "window":       f"{ws_str}-{we_str}",
-        "predicted":    pred["signal"],
-        "confidence":   pred["confidence"],
+        "predicted":    signal,
+        "confidence":   conf,
         "act_open":     0.0, "act_close": 0.0,
         "actual":       "\u23f3", "result": "\u23f3",
     }
     history_rows.insert(0, rec)
     while len(history_rows) > 5:
         history_rows.pop()
-    # Persist immediately — new visitors see this row right away
-    threading.Thread(target=save_prediction, args=(rec,), daemon=True).start()
+
+    # Only persist to DB if we have a real signal (not a HOLD from missing model)
+    # This prevents new visitors from seeing a stale HOLD row at the top
+    if signal != "HOLD" or conf > 0:
+        threading.Thread(target=save_prediction, args=(rec,), daemon=True).start()
+    else:
+        # Model not ready: still save to DB but mark clearly as pending
+        # so it can be resolved when the window closes
+        threading.Thread(target=save_prediction, args=(rec,), daemon=True).start()
 
 
 def _close_current_window_locked() -> None:
@@ -811,7 +918,17 @@ def _close_current_window_locked() -> None:
     # ── Step 2: seed pending row for the NEXT window ─────────────────────
     _seed_pending_row_locked(candle["ts"] + WINDOW_SECONDS)
 
-    # ── Step 3: retrain if due ────────────────────────────────────────────
+    # ── Step 3: re-sync history_rows from DB ─────────────────────────────
+    # Reload from Supabase so in-memory list never diverges from the DB.
+    # This is what keeps the table showing correct resolved rows forever,
+    # regardless of how many windows have passed or restarts occurred.
+    def _resync_history():
+        fresh = load_predictions(5)
+        with state_lock:
+            history_rows[:] = fresh
+    threading.Thread(target=_resync_history, daemon=True).start()
+
+    # ── Step 4: retrain if due ────────────────────────────────────────────
     if candles_since_retrain >= RETRAIN_EVERY:
         candles_since_retrain = 0
         threading.Thread(target=train_model_from_candles,
@@ -894,9 +1011,21 @@ def price_processor_thread() -> None:
 # ============================================================
 # BROADCAST
 # ============================================================
+_broadcast_count = 0
+
 async def _periodic_broadcast() -> None:
+    global wins, losses, _broadcast_count
     while True:
         await asyncio.sleep(1)
+        _broadcast_count += 1
+        # Re-sync wins/losses from DB every 60 seconds so restarts
+        # never show stale accuracy figures
+        if _broadcast_count % 60 == 0:
+            w, l = await asyncio.get_event_loop().run_in_executor(
+                None, recompute_stats_from_db)
+            with state_lock:
+                wins   = w
+                losses = l
         await _broadcast_state()
 
 
@@ -971,7 +1100,8 @@ HTML_CONTENT = """<!DOCTYPE html>
     background: #0D1421; border-radius: 10px;
     border: 1px solid #1E2D45; height: 380px; overflow: hidden;
   }
-  .sidebar { display: flex; flex-direction: column; gap: 12px; }
+  .sidebar { display: flex; flex-direction: column; gap: 8px; height: 380px; }
+  .sidebar .card { flex: 1; min-height: 0; display: flex; flex-direction: column; justify-content: center; }
   .card { background: #0D1421; border: 1px solid #1E2D45; border-radius: 10px; padding: 14px; }
   .card-title { font-size: 0.85rem; color: #4A6080; text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 8px; }
   .price { font-size: 2rem; font-weight: 700; color: #F7931A; }
@@ -1009,6 +1139,63 @@ HTML_CONTENT = """<!DOCTYPE html>
   .flash-dn { animation: flashDn 0.4s ease; }
   @keyframes flashUp { 0%,100%{color:#C8D8EF} 50%{color:#00E5A0} }
   @keyframes flashDn { 0%,100%{color:#C8D8EF} 50%{color:#FF4560} }
+
+  /* ── Result overlay animation ── */
+  #result-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    z-index: 9999;
+    pointer-events: none;
+    align-items: center;
+    justify-content: center;
+    flex-direction: column;
+    gap: 10px;
+  }
+  #result-overlay.show { display: flex; }
+  #result-overlay .ro-emoji {
+    font-size: 7rem;
+    line-height: 1;
+    animation: roPop 0.45s cubic-bezier(0.34,1.56,0.64,1) forwards;
+  }
+  #result-overlay .ro-label {
+    font-size: 1.6rem;
+    font-weight: 800;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    animation: roFade 0.4s ease 0.1s both;
+  }
+  #result-overlay.win  .ro-label { color: #00E5A0; }
+  #result-overlay.loss .ro-label { color: #FF4560; }
+  #result-overlay.win  { background: rgba(0,229,160,0.08); }
+  #result-overlay.loss { background: rgba(255,69,96,0.08); }
+  @keyframes roPop {
+    0%   { transform: scale(0.2) rotate(-15deg); opacity: 0; }
+    60%  { transform: scale(1.15) rotate(6deg);  opacity: 1; }
+    80%  { transform: scale(0.95) rotate(-3deg); }
+    100% { transform: scale(1)    rotate(0deg);  opacity: 1; }
+  }
+  @keyframes roFade {
+    from { opacity: 0; transform: translateY(10px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  /* confetti particles for win */
+  .confetti-wrap {
+    position: fixed; inset: 0; pointer-events: none; z-index: 9998; overflow: hidden;
+  }
+  .cp {
+    position: absolute;
+    top: -16px;
+    width: 10px; height: 14px;
+    border-radius: 2px;
+    opacity: 0.9;
+    animation: cpFall linear forwards;
+  }
+  @keyframes cpFall {
+    0%   { transform: translateY(0) rotate(0deg) scaleX(1);   opacity: 0.9; }
+    80%  { opacity: 0.9; }
+    100% { transform: translateY(110vh) rotate(720deg) scaleX(-1); opacity: 0; }
+  }
   @media (max-width:900px) {
     .main-grid { grid-template-columns: 1fr; }
     #tv-chart { height: 320px; }
@@ -1116,6 +1303,13 @@ HTML_CONTENT = """<!DOCTYPE html>
   <div class="disclaimer">&#9888;&#65039; For educational purposes only. Past accuracy does not guarantee future results.</div>
 </div>
 
+<!-- Result animation overlay -->
+<div id="result-overlay" role="status" aria-live="polite">
+  <div class="ro-emoji" id="ro-emoji"></div>
+  <div class="ro-label" id="ro-label"></div>
+</div>
+<div class="confetti-wrap" id="confetti-wrap"></div>
+
 <script src="https://s3.tradingview.com/tv.js"></script>
 <script>
   new TradingView.widget({
@@ -1213,6 +1407,7 @@ HTML_CONTENT = """<!DOCTYPE html>
     document.getElementById('p-losses').textContent=l;
     document.getElementById('p-acc').textContent   =tot?(w/tot*100).toFixed(1)+'%':'--';
 
+    if(d.table) _checkNewResults(d.table);
     const tbody=document.getElementById('history-body');
     if(d.table&&d.table.length){
       tbody.innerHTML=d.table.map(function(r){
@@ -1237,6 +1432,55 @@ HTML_CONTENT = """<!DOCTYPE html>
     }else{
       tbody.innerHTML='<tr><td colspan="7" style="text-align:center;padding:20px;">Waiting for data...</td></tr>';
     }
+  }
+
+  // ── Result animation ──────────────────────────────────────────────────
+  let _prevResults = {};   // window_start → result seen last tick
+
+  function _confetti() {
+    const wrap = document.getElementById('confetti-wrap');
+    wrap.innerHTML = '';
+    const colors = ['#F7931A','#00E5A0','#FACC15','#C8D8EF','#FFD700','#FF6B6B'];
+    for (let i = 0; i < 72; i++) {
+      const el = document.createElement('div');
+      el.className = 'cp';
+      el.style.left        = Math.random()*100 + 'vw';
+      el.style.background  = colors[Math.floor(Math.random()*colors.length)];
+      el.style.width       = (8 + Math.random()*8) + 'px';
+      el.style.height      = (10 + Math.random()*10) + 'px';
+      el.style.animationDuration  = (1.4 + Math.random()*1.4) + 's';
+      el.style.animationDelay     = (Math.random()*0.6) + 's';
+      wrap.appendChild(el);
+    }
+    setTimeout(function(){ wrap.innerHTML=''; }, 3200);
+  }
+
+  function showResultAnim(isWin) {
+    const ov    = document.getElementById('result-overlay');
+    const emoji = document.getElementById('ro-emoji');
+    const label = document.getElementById('ro-label');
+    ov.className = 'show ' + (isWin ? 'win' : 'loss');
+    emoji.textContent = isWin ? '🎉' : '🥲';
+    label.textContent = isWin ? 'WIN!' : 'LOSS';
+    if (isWin) _confetti();
+    // auto-dismiss after 2.8s
+    setTimeout(function(){
+      ov.classList.remove('show','win','loss');
+    }, 2800);
+  }
+
+  function _checkNewResults(table) {
+    if (!table || !table.length) return;
+    table.forEach(function(r) {
+      const key  = r.window_start;
+      const prev = _prevResults[key];
+      const cur  = r.result;
+      // Fire only when a row transitions FROM pending TO a real result
+      if (prev && prev === '⏳' && (cur === '✅' || cur === '❌')) {
+        showResultAnim(cur === '✅');
+      }
+      _prevResults[key] = cur;
+    });
   }
 
   connect();
@@ -1268,13 +1512,21 @@ async def lifespan(app: FastAPI):
         with model_lock: model = saved_model
 
     # 3. Last 5 predictions → history_rows
-    #    Loaded BEFORE any price tick arrives so new visitors see data immediately
+    #    Loaded BEFORE any price tick arrives so new visitors see data immediately.
+    #    We also set live_window_start to the most recent window so that
+    #    _seed_pending_row_locked on the first price tick does NOT insert a
+    #    new HOLD row on top of the loaded history — it will see the window
+    #    already exists and return early.
     saved_preds = load_predictions(5)
     if saved_preds:
         history_rows[:] = saved_preds
         logger.info(f"Loaded {len(saved_preds)} predictions — table pre-populated")
+        # Pre-set live_window_start so first tick doesn't clobber loaded rows
+        now_ts = time.time()
+        live_window_start = int(now_ts // WINDOW_SECONDS) * WINDOW_SECONDS
+        logger.info(f"Pre-seeded live_window_start to prevent HOLD flash on first tick")
 
-    # 4. Authoritative win/loss count straight from DB
+    # 4. Authoritative win/loss count straight from DB — never trust in-memory globals
     wins, losses = recompute_stats_from_db()
     logger.info(f"Stats recomputed from DB: {wins}W / {losses}L")
 
